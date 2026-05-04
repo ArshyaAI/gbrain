@@ -22,6 +22,7 @@ import type {
 import type { OAuthServerProvider, AuthorizationParams } from '@modelcontextprotocol/sdk/server/auth/provider.js';
 import type { OAuthRegisteredClientsStore } from '@modelcontextprotocol/sdk/server/auth/clients.js';
 import type { AuthInfo } from '@modelcontextprotocol/sdk/server/auth/types.js';
+import { InvalidTokenError } from '@modelcontextprotocol/sdk/server/auth/errors.js';
 import { hashToken, generateToken } from './utils.ts';
 
 // ---------------------------------------------------------------------------
@@ -335,7 +336,7 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
       // throw here rather than return an undefined-bearing AuthInfo.
       const expiresAt = coerceTimestamp(row.expires_at);
       if (expiresAt === undefined || expiresAt < now) {
-        throw new Error('Token expired');
+        throw new InvalidTokenError('Token expired');
       }
       return {
         token,
@@ -370,7 +371,7 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
       } as AuthInfo;
     }
 
-    throw new Error('Invalid token');
+    throw new InvalidTokenError('Invalid token');
   }
 
   // -------------------------------------------------------------------------
