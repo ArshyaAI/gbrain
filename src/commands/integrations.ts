@@ -571,18 +571,89 @@ function checkSecrets(secrets: RecipeSecret[]): { set: string[]; missing: Recipe
   return { set, missing };
 }
 
+interface SecretReadiness {
+  set: string[];
+  missing: RecipeSecret[];
+  configured: boolean;
+  provider?: string;
+  optionalMissing: RecipeSecret[];
+}
+
+function hasSecret(secrets: RecipeSecret[], name: string): boolean {
+  return secrets.some(s => s.name === name);
+}
+
+function envHasAll(names: string[]): boolean {
+  return names.every(name => Boolean(process.env[name]));
+}
+
+function secretNames(secrets: RecipeSecret[]): Set<string> {
+  return new Set(secrets.map(s => s.name));
+}
+
+function missingExcept(missing: RecipeSecret[], requiredNames: string[]): RecipeSecret[] {
+  const required = new Set(requiredNames);
+  return missing.filter(s => !required.has(s.name));
+}
+
+export function getSecretReadiness(recipe: ParsedRecipe): SecretReadiness {
+  const secrets = recipe.frontmatter.secrets;
+  const { set, missing } = checkSecrets(secrets);
+
+  // Some recipes intentionally support alternative auth providers. The classic
+  // example is Gmail/Calendar credential access: either ClawVisor OR direct
+  // Google OAuth is enough. Treating every listed secret as mandatory makes
+  // healthy ClawVisor-backed installs look AVAILABLE forever because the
+  // fallback GOOGLE_* vars are absent.
+  const names = secretNames(secrets);
+  const supportsClawVisor = hasSecret(secrets, 'CLAWVISOR_URL') && hasSecret(secrets, 'CLAWVISOR_AGENT_TOKEN');
+  const supportsGoogleOAuth = hasSecret(secrets, 'GOOGLE_CLIENT_ID') && hasSecret(secrets, 'GOOGLE_CLIENT_SECRET');
+
+  if (supportsClawVisor && envHasAll(['CLAWVISOR_URL', 'CLAWVISOR_AGENT_TOKEN'])) {
+    return {
+      set,
+      missing,
+      configured: true,
+      provider: 'ClawVisor',
+      optionalMissing: missingExcept(missing, ['CLAWVISOR_URL', 'CLAWVISOR_AGENT_TOKEN']),
+    };
+  }
+
+  if (supportsGoogleOAuth && envHasAll(['GOOGLE_CLIENT_ID', 'GOOGLE_CLIENT_SECRET'])) {
+    return {
+      set,
+      missing,
+      configured: true,
+      provider: 'Google OAuth',
+      optionalMissing: missingExcept(missing, ['GOOGLE_CLIENT_ID', 'GOOGLE_CLIENT_SECRET']),
+    };
+  }
+
+  // Generic fallback: recipes without explicit alternatives still require all
+  // declared secrets. If a future recipe declares no secrets, it is configured
+  // by definition and heartbeat determines whether it is active.
+  const configured = missing.length === 0;
+  return {
+    set,
+    missing,
+    configured,
+    provider: configured && names.size > 0 ? 'all declared secrets' : undefined,
+    optionalMissing: [],
+  };
+}
+
 type IntegrationStatus = 'available' | 'configured' | 'active';
 
 function getStatus(recipe: ParsedRecipe): IntegrationStatus {
-  const { set, missing } = checkSecrets(recipe.frontmatter.secrets);
-  // All required secrets must be set to be "configured"
-  if (missing.length > 0) return 'available';
+  const readiness = getSecretReadiness(recipe);
+  if (!readiness.configured) return 'available';
 
   const heartbeat = readHeartbeat(recipe.frontmatter.id);
   const recentEvents = heartbeat.filter(e =>
     Date.now() - new Date(e.ts).getTime() < 24 * 60 * 60 * 1000
   );
-  if (recentEvents.length > 0) return 'active';
+  const latestRecent = recentEvents[recentEvents.length - 1];
+  if (latestRecent?.status === 'ok') return 'active';
 
   return 'configured';
 }
@@ -667,7 +738,11 @@ function cmdList(args: string[]): void {
       const statusStr = status === 'active' ? 'ACTIVE' : status === 'configured' ? 'CONFIGURED' : 'AVAILABLE';
       const id = r.frontmatter.id.padEnd(22);
       const desc = r.frontmatter.description.slice(0, 28).padEnd(28);
-      const deps = r.frontmatter.requires.length > 0 ? ` (needs ${r.frontmatter.requires.join(', ')})` : '';
+      const missingDeps = r.frontmatter.requires.filter(dep => {
+        const depRecipe = recipes.find(item => item.frontmatter.id === dep);
+        return !depRecipe || getStatus(depRecipe) === 'available';
+      });
+      const deps = missingDeps.length > 0 ? ` (needs ${missingDeps.join(', ')})` : '';
       console.log(`  ${id}${desc}  ${statusStr}${deps}`);
     }
   };
@@ -734,7 +809,8 @@ function cmdStatus(args: string[]): void {
   const recipe = findRecipe(id);
   if (!recipe) return;
 
-  const { set, missing } = checkSecrets(recipe.frontmatter.secrets);
+  const readiness = getSecretReadiness(recipe);
+  const { set, missing, optionalMissing } = readiness;
   const heartbeat = readHeartbeat(recipe.frontmatter.id);
   const status = getStatus(recipe);
 
@@ -742,7 +818,12 @@ function cmdStatus(args: string[]): void {
     console.log(JSON.stringify({
       id: recipe.frontmatter.id,
       status,
-      secrets: { set, missing: missing.map(m => ({ name: m.name, where: m.where })) },
+      configured_provider: readiness.provider || null,
+      secrets: {
+        set,
+        missing: missing.map(m => ({ name: m.name, where: m.where })),
+        optional_missing: optionalMissing.map(m => ({ name: m.name, where: m.where })),
+      },
       heartbeat: {
         total_events: heartbeat.length,
         last_event: heartbeat.length > 0 ? heartbeat[heartbeat.length - 1] : null,
@@ -753,16 +834,25 @@ function cmdStatus(args: string[]): void {
 
   console.log(`\n${recipe.frontmatter.name}: ${status.toUpperCase()}`);
 
+  if (readiness.provider) {
+    console.log(`\nCredential route: ${readiness.provider}`);
+  }
+
   if (set.length > 0) {
     console.log('\nSecrets configured:');
     for (const s of set) console.log(`  ${s}  [set]`);
   }
 
-  if (missing.length > 0) {
-    console.log('\nMissing secrets:');
+  if (!readiness.configured && missing.length > 0) {
+    console.log('\nMissing required secrets:');
     for (const m of missing) {
       console.log(`  ${m.name}  [missing]`);
       console.log(`    Get it: ${m.where}`);
+    }
+  } else if (optionalMissing.length > 0) {
+    console.log(`\nOptional alternative secrets missing (not required because ${readiness.provider} is configured):`);
+    for (const m of optionalMissing) {
+      console.log(`  ${m.name}  [missing]`);
     }
   }
 
@@ -776,7 +866,11 @@ function cmdStatus(args: string[]): void {
 
     if (ageMs > 24 * 60 * 60 * 1000) {
       console.log(`  WARNING: no events in ${Math.floor(ageMs / (24 * 60 * 60 * 1000))} days`);
-      console.log('  Check: is ngrok running? Is the voice server alive?');
+      if (recipe.frontmatter.id === 'ngrok-tunnel' || recipe.frontmatter.id === 'twilio-voice-brain') {
+        console.log('  Check: is ngrok running? Is the voice server alive?');
+      } else {
+        console.log('  Check: is the collector scheduled and are its credentials/tasks active?');
+      }
       console.log('  Run: gbrain integrations doctor');
     }
   } else {

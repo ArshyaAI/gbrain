@@ -8,6 +8,7 @@ import {
   hostnameToOctets,
   isPrivateIpv4,
   isInternalUrl,
+  getSecretReadiness,
 } from '../src/commands/integrations.ts';
 
 // --- parseRecipe tests ---
@@ -159,6 +160,85 @@ Content.
   });
 });
 
+// --- Secret readiness tests ---
+
+describe('secret readiness', () => {
+  const content = `---
+id: email-like
+name: Email Like
+secrets:
+  - name: CLAWVISOR_URL
+    description: ClawVisor URL
+    where: https://clawvisor.com
+  - name: CLAWVISOR_AGENT_TOKEN
+    description: ClawVisor token
+    where: https://clawvisor.com
+  - name: GOOGLE_CLIENT_ID
+    description: Google client ID
+    where: https://console.cloud.google.com/apis/credentials
+  - name: GOOGLE_CLIENT_SECRET
+    description: Google client secret
+    where: https://console.cloud.google.com/apis/credentials
+---
+Body.
+`;
+
+  function withCleanAuthEnv(fn: () => void) {
+    const saved = {
+      CLAWVISOR_URL: process.env.CLAWVISOR_URL,
+      CLAWVISOR_AGENT_TOKEN: process.env.CLAWVISOR_AGENT_TOKEN,
+      GOOGLE_CLIENT_ID: process.env.GOOGLE_CLIENT_ID,
+      GOOGLE_CLIENT_SECRET: process.env.GOOGLE_CLIENT_SECRET,
+    };
+    delete process.env.CLAWVISOR_URL;
+    delete process.env.CLAWVISOR_AGENT_TOKEN;
+    delete process.env.GOOGLE_CLIENT_ID;
+    delete process.env.GOOGLE_CLIENT_SECRET;
+    try {
+      fn();
+    } finally {
+      for (const [key, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  }
+
+  test('ClawVisor satisfies alternative Gmail/Calendar credential recipes without Google OAuth', () => {
+    withCleanAuthEnv(() => {
+      process.env.CLAWVISOR_URL = 'https://gateway.example.com';
+      process.env.CLAWVISOR_AGENT_TOKEN = 'token';
+      const recipe = parseRecipe(content, 'email-like.md')!;
+      const readiness = getSecretReadiness(recipe);
+      expect(readiness.configured).toBe(true);
+      expect(readiness.provider).toBe('ClawVisor');
+      expect(readiness.optionalMissing.map(s => s.name)).toEqual(['GOOGLE_CLIENT_ID', 'GOOGLE_CLIENT_SECRET']);
+    });
+  });
+
+  test('Google OAuth satisfies alternative Gmail/Calendar credential recipes without ClawVisor', () => {
+    withCleanAuthEnv(() => {
+      process.env.GOOGLE_CLIENT_ID = 'client';
+      process.env.GOOGLE_CLIENT_SECRET = 'secret';
+      const recipe = parseRecipe(content, 'email-like.md')!;
+      const readiness = getSecretReadiness(recipe);
+      expect(readiness.configured).toBe(true);
+      expect(readiness.provider).toBe('Google OAuth');
+      expect(readiness.optionalMissing.map(s => s.name)).toEqual(['CLAWVISOR_URL', 'CLAWVISOR_AGENT_TOKEN']);
+    });
+  });
+
+  test('alternative credential recipes are unavailable when neither route is complete', () => {
+    withCleanAuthEnv(() => {
+      process.env.CLAWVISOR_URL = 'https://gateway.example.com';
+      const recipe = parseRecipe(content, 'email-like.md')!;
+      const readiness = getSecretReadiness(recipe);
+      expect(readiness.configured).toBe(false);
+      expect(readiness.provider).toBeUndefined();
+    });
+  });
+});
+
 // --- CLI structure tests ---
 
 describe('CLI integration', () => {
@@ -260,6 +340,25 @@ describe('twilio-voice-brain recipe', () => {
       const depPath = resolve(recipesDir, `${dep}.md`);
       expect(existsSync(depPath)).toBe(true);
     }
+  });
+});
+
+describe('github-pulse recipe', () => {
+  test('recipe file parses as a ClawVisor-backed sense', () => {
+    const { readFileSync } = require('fs');
+    const content = readFileSync(
+      new URL('../recipes/github-pulse.md', import.meta.url),
+      'utf-8'
+    );
+    const recipe = parseRecipe(content, 'github-pulse.md');
+    expect(recipe).not.toBeNull();
+    expect(recipe!.frontmatter.id).toBe('github-pulse');
+    expect(recipe!.frontmatter.category).toBe('sense');
+    expect(recipe!.frontmatter.requires).toContain('credential-gateway');
+    expect(recipe!.frontmatter.secrets.map((s: any) => s.name)).toEqual([
+      'CLAWVISOR_URL',
+      'CLAWVISOR_AGENT_TOKEN',
+    ]);
   });
 });
 

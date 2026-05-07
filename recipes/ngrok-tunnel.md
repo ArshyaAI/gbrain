@@ -11,10 +11,10 @@ secrets:
     where: https://dashboard.ngrok.com/get-started/your-authtoken — sign up, then copy your authtoken
 health_checks:
   - type: command
-    argv: ["pgrep", "-f", "ngrok.*http"]
+    argv: ["bash", "-lc", "pgrep -f 'ngrok.*http' >/dev/null"]
     label: "ngrok process"
-  - type: http
-    url: "http://localhost:4040/api/tunnels"
+  - type: command
+    argv: ["bash", "-lc", "curl -sf http://localhost:4040/api/tunnels >/dev/null"]
     label: "ngrok API"
 setup_time: 10 min
 cost_estimate: "$8/mo for Hobby tier (fixed domain). Free tier works but URLs change on restart."
