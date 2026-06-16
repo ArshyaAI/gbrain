@@ -2,8 +2,7 @@
  * Shared link/timeline extraction utilities.
  *
  * Used by:
- *   - src/commands/link-extract.ts        (batch DB extraction)
- *   - src/commands/timeline-extract.ts    (batch DB extraction)
+ *   - src/commands/extract.ts             (batch DB + FS extraction — `gbrain extract links|timeline|all`)
  *   - src/commands/backlinks.ts           (filesystem walk, legacy)
  *   - src/core/operations.ts put_page     (auto-link post-hook)
  *
@@ -14,6 +13,22 @@
 
 import type { BrainEngine } from './engine.ts';
 import type { PageType } from './types.ts';
+import { ensureWellFormed } from './text-safe.ts';
+
+/**
+ * v0.42.7 — link-extraction version stamp. Bump this ISO timestamp whenever the
+ * shape of `extractPageLinks` / `inferLinkType` / `parseTimelineEntries` changes
+ * meaningfully, so the extraction freshness watermark (`pages.links_extracted_at`)
+ * treats every previously-stamped page as stale and re-extracts it on the next
+ * `gbrain extract --stale` sweep. Same role CHUNKER_VERSION plays for chunking.
+ *
+ * Consumed by `countStalePagesForExtraction` / `listStalePagesForExtraction`
+ * (both engines) and the `links_extraction_lag` doctor check: a page is stale
+ * when `links_extracted_at IS NULL OR links_extracted_at < LINK_EXTRACTOR_VERSION_TS
+ * OR updated_at > links_extracted_at`. It is an ISO-8601 string (NOT a number) —
+ * the column is TIMESTAMPTZ and the predicate binds it as `::timestamptz`.
+ */
+export const LINK_EXTRACTOR_VERSION_TS = '2026-05-31T00:00:00Z';
 
 // ─── Entity references ──────────────────────────────────────────
 
@@ -32,7 +47,31 @@ export interface EntityRef {
    *   - sourceId null  → 'unqualified'
    */
   sourceId?: string | null;
+  /**
+   * Issue #972: set when the ref came from the generic `[[bare-name]]`
+   * pass (not gated by DIR_PATTERN). The `slug` field holds the literal
+   * wikilink text — callers MUST run it through a SlugResolver's
+   * `resolveBasenameMatches` (gated by `link_resolution.global_basename`)
+   * before persisting. Untagged refs already match a known entity dir
+   * (people/, companies/, etc.) and need no resolution.
+   *
+   * One ref tagged `needsResolution: true` may resolve to MULTIPLE target
+   * slugs when multiple pages share the basename. The caller emits one
+   * LinkCandidate per resolved match.
+   */
+  needsResolution?: boolean;
 }
+
+/**
+ * Issue #972: edge type stamped on graph rows produced by the
+ * global-basename wikilink resolution path. Distinct from the verb-
+ * inferred types (`mentions`, `works_at`, etc.) so users can audit or
+ * prune via `gbrain graph-query <slug> --type wikilink_basename`.
+ *
+ * All edges from this path also carry `linkSource: 'wikilink-resolved'`
+ * (the link-source provenance is the why; this edge type is the what).
+ */
+export const WIKILINK_BASENAME_LINK_TYPE = 'wikilink_basename';
 
 /** v0.17.0: how a link's target source was pinned at extraction time. */
 export type LinkResolutionType = 'qualified' | 'unqualified';
@@ -92,12 +131,44 @@ const QUALIFIED_WIKILINK_RE = new RegExp(
 );
 
 /**
+ * Issue #972: generic Obsidian-style wikilink — matches `[[anything]]`
+ * with no DIR_PATTERN gate. Wiki/topic/learning pages frequently link
+ * via `[[bare-name]]` (`[[Fast-Weigh]]`, `[[2026-05-07-cost-plan]]`,
+ * `[[struktura]]`) where the literal text isn't a canonical slug; the
+ * resolver is responsible for matching it to the real page via
+ * basename uniqueness.
+ *
+ * Used AFTER QUALIFIED_WIKILINK_RE and WIKILINK_RE pick off their
+ * cases — the masked-ranges pass in extractEntityRefs prevents
+ * double-emission. Refs from this pass are tagged
+ * `needsResolution: true` so callers know to run them through a
+ * SlugResolver before the page-existence check.
+ *
+ * Regex shape is the union of the two existing wikilink regexes,
+ * minus the DIR_PATTERN gate. The character class disallows pipe,
+ * close-bracket, hash (anchor separator), newline, and open-bracket
+ * so we never match across line breaks or capture nested `[[...]]`.
+ *
+ * Adapted from PR #1233 (rayers).
+ */
+const WIKILINK_GENERIC_RE = /\[\[([^|\]#\n[]+?)(?:#[^|\]]*?)?(?:\|([^\]]+?))?\]\]/g;
+
+/**
+ * Issue #972 (codex [P2]): a markdown link whose LABEL contains a wikilink,
+ * e.g. `[see [[acme]]](companies/acme.md)`. Pass-1's ENTITY_REF_RE can't match
+ * the nested `]]` so it never spans this; without masking, the generic 2c pass
+ * would emit a stray basename ref for the inner `[[acme]]`. Mask the whole
+ * span out of the 2c scan so a wikilink inside a markdown label is inert.
+ */
+const MARKDOWN_LABEL_WIKILINK_RE = /\[[^\]\n]*\[\[[^\]\n]+\]\][^\]\n]*\]\([^)\n]+\)/g;
+
+/**
  * Strip fenced code blocks (```...```) and inline code (`...`) from markdown,
  * replacing them with whitespace of equivalent length. Preserves byte offsets
  * for any caller that cares about positions; for our extractors this is just
  * defense-in-depth — slugs inside code are not real entity references.
  */
-function stripCodeBlocks(content: string): string {
+export function stripCodeBlocks(content: string): string {
   let out = '';
   let i = 0;
   while (i < content.length) {
@@ -128,6 +199,99 @@ function stripCodeBlocks(content: string): string {
 }
 
 /**
+ * A code-reference found in markdown prose. Created by extractCodeRefs and
+ * consumed by importFromFile's tail to build doc↔impl edges (v0.19.0 E1).
+ */
+export interface CodeRef {
+  /** Raw matched path (e.g. 'src/core/sync.ts'). */
+  path: string;
+  /** Optional line number from 'src/foo.ts:42'. */
+  line?: number;
+  /** Index in the source string. */
+  index: number;
+}
+
+// v0.19.0 E1 — markdown guides that cite 'src/core/sync.ts:42' create an
+// edge to the code page that imported that file. Regex is anchored against
+// the common gbrain repo layout directories so arbitrary prose like
+// "in foo/bar.js" doesn't generate false positives.
+//
+// The extension list is aligned with detectCodeLanguage in chunkers/code.ts.
+// Paths NOT matching these extensions are ignored because they wouldn't
+// have a code page to edge to anyway.
+const CODE_REF_REGEX = /\b((?:src|lib|app|test|tests|scripts|docs|packages|internal|cmd|examples)\/[\w\-./]+\.(?:ts|tsx|mts|cts|js|jsx|mjs|cjs|py|rb|go|rs|java|cs|cpp|cc|hpp|c|h|php|swift|kt|scala|lua|ex|exs|elm|ml|dart|zig|sol|sh|bash|css|html|vue|json|yaml|yml|toml))(?::(\d+))?\b/g;
+
+/**
+ * Extract code-path references (e.g. 'src/core/sync.ts:42') from markdown
+ * prose. Deduped by path.
+ */
+/**
+ * v0.27.1 (cherry-3): path-proximity auto-link candidate finder for image
+ * ingest. Given an image slug like `originals/photos/2026-05-04-foo.jpg`,
+ * proposes candidate sibling slugs for an `image_of` edge:
+ *   1. `originals/meetings/2026-05-04-foo.md` (parallel directory + same basename)
+ *   2. `<parent>/foo.md` (same directory + sibling basename minus extension)
+ *
+ * Returns slug candidates in priority order. Caller (importImageFile) checks
+ * which candidates exist as pages and emits the edge for the first match.
+ */
+export function imageOfCandidates(imageSlug: string): string[] {
+  const lower = imageSlug.toLowerCase();
+  const lastSlash = lower.lastIndexOf('/');
+  if (lastSlash < 0) return [];
+  const dir = lower.slice(0, lastSlash);
+  const file = lower.slice(lastSlash + 1);
+  // Strip image extension from basename to get a stable identifier.
+  const base = file.replace(/\.(png|jpg|jpeg|gif|webp|heic|heif|avif)$/i, '');
+  if (!base) return [];
+
+  const out: string[] = [];
+
+  // Heuristic 1: parallel directory swap. originals/photos/X → originals/meetings/X
+  const dirParts = dir.split('/');
+  const PHOTO_DIRS = new Set(['photos', 'images', 'screenshots', 'media']);
+  const SIBLING_DIRS = ['meetings', 'notes', 'daily', 'people', 'companies', 'deals', 'projects'];
+  for (let i = 0; i < dirParts.length; i++) {
+    if (PHOTO_DIRS.has(dirParts[i])) {
+      for (const sib of SIBLING_DIRS) {
+        const swapped = [...dirParts];
+        swapped[i] = sib;
+        out.push(`${swapped.join('/')}/${base}`);
+      }
+    }
+  }
+
+  // Heuristic 2: same directory, basename without ext as a markdown page.
+  out.push(`${dir}/${base}`);
+
+  // Deduplicate, drop the imageSlug itself if it accidentally roundtrips.
+  const seen = new Set<string>();
+  return out.filter(s => {
+    if (s === lower) return false;
+    if (seen.has(s)) return false;
+    seen.add(s);
+    return true;
+  });
+}
+
+export function extractCodeRefs(content: string): CodeRef[] {
+  const seen = new Set<string>();
+  const refs: CodeRef[] = [];
+  let match: RegExpExecArray | null;
+  // Using a fresh regex object per call to avoid lastIndex state leaking
+  // across invocations.
+  const re = new RegExp(CODE_REF_REGEX.source, 'g');
+  while ((match = re.exec(content)) !== null) {
+    const path = match[1]!;
+    if (seen.has(path)) continue;
+    seen.add(path);
+    const line = match[2] ? parseInt(match[2], 10) : undefined;
+    refs.push({ path, line, index: match.index });
+  }
+  return refs;
+}
+
+/**
  * Extract `[Name](path-to-people-or-company)` references from arbitrary content.
  * Both filesystem-relative paths (with `../` and `.md`) and bare engine-style
  * slugs (`people/slug`) are matched. Returns one EntityRef per match (no dedup
@@ -143,6 +307,7 @@ export function extractEntityRefs(content: string): EntityRef[] {
   //    Markdown links have no source-qualification syntax — they're
   //    always unqualified. Omit sourceId so the shape stays compatible
   //    with pre-v0.17 consumers doing strict equality.
+  const markdownRanges: Array<[number, number]> = [];
   const mdPattern = new RegExp(ENTITY_REF_RE.source, ENTITY_REF_RE.flags);
   while ((match = mdPattern.exec(stripped)) !== null) {
     const name = match[1];
@@ -150,6 +315,7 @@ export function extractEntityRefs(content: string): EntityRef[] {
     const slug = fullPath;
     const dir = fullPath.split('/')[0];
     refs.push({ name, slug, dir });
+    markdownRanges.push([match.index, match.index + match[0].length]);
   }
 
   // 2a. v0.17.0 qualified wikilinks: [[source-id:path]] or [[source-id:path|Display]]
@@ -171,6 +337,7 @@ export function extractEntityRefs(content: string): EntityRef[] {
 
   // 2b. Unqualified Obsidian wikilinks: [[path]] or [[path|Display Text]]
   //     Same shape rule: omit sourceId when unqualified.
+  const unqualifiedRanges: Array<[number, number]> = [];
   const unmasked = maskRanges(stripped, qualifiedRanges);
   const wikiPattern = new RegExp(WIKILINK_RE.source, WIKILINK_RE.flags);
   while ((match = wikiPattern.exec(unmasked)) !== null) {
@@ -181,6 +348,38 @@ export function extractEntityRefs(content: string): EntityRef[] {
     const displayName = (match[2] || slug).trim();
     const dir = slug.split('/')[0];
     refs.push({ name: displayName, slug, dir });
+    unqualifiedRanges.push([match.index, match.index + match[0].length]);
+  }
+
+  // 2c. Issue #972: generic `[[bare-name]]` wikilinks not gated by
+  //     DIR_PATTERN. Wiki/topic/learning content frequently uses these
+  //     where the bare text isn't a canonical brain slug. Tagged
+  //     `needsResolution: true` so the caller routes them through a
+  //     SlugResolver's `resolveBasenameMatches` before persisting.
+  //     Mask out 2a/2b ranges so we don't double-emit; skip qualified-
+  //     syntax tokens (contain `:`) that would be 2a's job. Issue #972
+  //     (codex [P2]): ALSO mask pass-1 markdown-link ranges so a wikilink
+  //     inside a markdown label — `[see [[acme]]](companies/acme.md)` —
+  //     doesn't spawn a stray generic basename ref from inside the label.
+  const labelWikilinkRanges: Array<[number, number]> = [];
+  const labelWlPattern = new RegExp(MARKDOWN_LABEL_WIKILINK_RE.source, MARKDOWN_LABEL_WIKILINK_RE.flags);
+  while ((match = labelWlPattern.exec(stripped)) !== null) {
+    labelWikilinkRanges.push([match.index, match.index + match[0].length]);
+  }
+  const genericMasked = maskRanges(
+    stripped,
+    [...markdownRanges, ...qualifiedRanges, ...unqualifiedRanges, ...labelWikilinkRanges],
+  );
+  const genericPattern = new RegExp(WIKILINK_GENERIC_RE.source, WIKILINK_GENERIC_RE.flags);
+  while ((match = genericPattern.exec(genericMasked)) !== null) {
+    let slug = match[1].trim();
+    if (!slug) continue;
+    if (slug.includes('://')) continue;
+    if (slug.includes(':')) continue; // qualified-syntax token; 2a owns these
+    if (slug.endsWith('.md')) slug = slug.slice(0, -3);
+    const displayName = (match[2] || slug).trim();
+    const dir = slug.includes('/') ? slug.split('/')[0] : '';
+    refs.push({ name: displayName, slug, dir, needsResolution: true });
   }
 
   return refs;
@@ -269,11 +468,44 @@ export async function extractPageLinks(
   frontmatter: Record<string, unknown>,
   pageType: PageType,
   resolver: SlugResolver,
+  opts: { globalBasename?: boolean; skipFrontmatter?: boolean } = {},
 ): Promise<PageLinksResult> {
   const candidates: LinkCandidate[] = [];
 
   // 1. Markdown entity refs.
   for (const ref of extractEntityRefs(content)) {
+    // Issue #972: refs from the generic `[[bare-name]]` pass carry the
+    // literal wikilink text, not a real page slug. When global_basename
+    // mode is on AND the resolver implements basename lookup, resolve
+    // to every matching page and emit one candidate per match. When the
+    // flag is off (default), drop silently — back-compat with the
+    // pre-v0.40.8.2 behavior of dropping bare wikilinks outside
+    // DIR_PATTERN.
+    if (ref.needsResolution) {
+      if (!opts.globalBasename || typeof resolver.resolveBasenameMatches !== 'function') {
+        continue;
+      }
+      // Issue #972 (codex): resolve by the wikilink TARGET (ref.slug — the
+      // text inside `[[...]]` before any `|`), NOT the display alias
+      // (ref.name = match[2]). `[[struktura|the project]]` must resolve
+      // `struktura`, not "the project". The display text is for context only.
+      const matches = await resolver.resolveBasenameMatches(ref.slug);
+      if (matches.length === 0) continue;
+      const idx = content.indexOf(ref.slug);
+      const context = idx >= 0 ? excerpt(content, idx, 240) : ref.name;
+      for (const matched of matches) {
+        // Issue #972 (codex [P2]): a basename `[[own-tail]]` on its own page
+        // resolves back to itself — drop the self-loop.
+        if (matched === slug) continue;
+        candidates.push({
+          targetSlug: matched,
+          linkType: WIKILINK_BASENAME_LINK_TYPE,
+          context,
+          linkSource: 'wikilink-resolved',
+        });
+      }
+      continue;
+    }
     const idx = content.indexOf(ref.name);
     // Wider context window (240 chars vs original 80) catches verbs that
     // appear at sentence-or-paragraph distance from the slug — common in
@@ -311,12 +543,28 @@ export async function extractPageLinks(
   }
 
   // 3. Frontmatter-derived edges (v0.13). Includes the legacy `source:`
-  // field along with the full field map.
-  const fm = await extractFrontmatterLinks(slug, pageType, frontmatter, resolver);
-  candidates.push(...fm.candidates);
+  // field along with the full field map. Caller can suppress via
+  // `opts.skipFrontmatter` — used by `extractLinksFromDB` to keep
+  // `--include-frontmatter` off semantics while still passing a real
+  // resolver (needed for `resolveBasenameMatches` in global-basename
+  // mode). Pre-issue-#972 this gating lived in the caller via a
+  // synthetic `nullResolver`; that pattern broke once the bare-wikilink
+  // path needed `resolveBasenameMatches` on the real resolver.
+  let fmUnresolved: UnresolvedFrontmatterRef[] = [];
+  if (!opts.skipFrontmatter) {
+    const fm = await extractFrontmatterLinks(slug, pageType, frontmatter, resolver);
+    candidates.push(...fm.candidates);
+    fmUnresolved = fm.unresolved;
+  }
 
   // Within-page dedup: same (fromSlug, targetSlug, linkType, linkSource)
   // collapses to one entry. First occurrence wins.
+  // Issue #972 (codex P2d, decided): a qualified `[[companies/acme]]` (typed
+  // markdown edge) and a bare `[[acme]]` (wikilink-resolved edge) to the SAME
+  // target are KEPT as separate rows — they carry different provenance
+  // (link_source) and link_type, and the audit trail (which kind of reference
+  // created the edge) is worth more than collapsing them. graph-query callers
+  // that want a unique target set dedup on to_slug themselves.
   const seen = new Set<string>();
   const result: LinkCandidate[] = [];
   for (const c of candidates) {
@@ -325,15 +573,25 @@ export async function extractPageLinks(
     seen.add(key);
     result.push(c);
   }
-  return { candidates: result, unresolved: fm.unresolved };
+  return { candidates: result, unresolved: fmUnresolved };
 }
 
-/** Excerpt a window of `width` chars around `idx`, collapsed to one line. */
+/**
+ * Excerpt a window of `width` chars around `idx`, collapsed to one line.
+ *
+ * The window is sliced by raw UTF-16 index, so a boundary can land inside a
+ * surrogate pair (any non-BMP char — emoji, math alphanumerics, non-BMP CJK)
+ * and leave a lone surrogate half. That lone half flows into the link `context`
+ * field and, when the batch is serialized for the `jsonb_to_recordset` insert,
+ * makes Postgres reject the WHOLE batch on the `::jsonb` cast — aborting the
+ * entire `extract --stale` run (#2011). `ensureWellFormed` replaces any orphaned
+ * half with U+FFFD before the slice escapes this function.
+ */
 function excerpt(s: string, idx: number, width: number): string {
   const half = Math.floor(width / 2);
   const start = Math.max(0, idx - half);
   const end = Math.min(s.length, idx + half);
-  return s.slice(start, end).replace(/\s+/g, ' ').trim();
+  return ensureWellFormed(s.slice(start, end)).replace(/\s+/g, ' ').trim();
 }
 
 // ─── Relationship type inference (deterministic, zero LLM) ──────
@@ -353,7 +611,20 @@ function excerpt(s: string, idx: number, width: number): string {
 //     explicit "advisor"/"advise" rooting.
 
 // Employment context: position + at/of, or explicit work verbs.
-const WORKS_AT_RE = /\b(?:CEO of|CTO of|COO of|CFO of|CMO of|CRO of|VP at|VP of|VPs? Engineering|VPs? Product|works at|worked at|working at|employed by|employed at|joined as|joined the team|engineer at|engineer for|director at|director of|head of|leads engineering|leads product|currently at|previously at|previously worked at|spent .* (?:years|months) at|stint at|tenure at)\b/i;
+//
+// v0.10.5 additions (drive works_at 58% → >85% on rich prose):
+//   - Role-prefixed engineer patterns: "senior engineer at", "staff engineer at",
+//     "principal engineer at", "lead engineer at". Current "engineer at" only
+//     hits if the word "engineer" is immediately adjacent; prose often uses
+//     rank-qualified forms.
+//   - Generic role patterns: "backend engineer at", "frontend engineer at",
+//     "ML engineer at", "data engineer at", "full-stack engineer at".
+//   - Broader role verbs: "manages engineering at", "running product at",
+//     "leads the [team] at", "heads up engineering at".
+//   - Possessive time: "his time at", "her time at", "their time at", "my time at".
+//   - Role noun forms: "role at", "tenure as", "stint as", "position at".
+//   - Promoted/staff-engineer forms: "promoted to (staff|senior|principal) engineer at".
+const WORKS_AT_RE = /\b(?:CEO of|CTO of|COO of|CFO of|CMO of|CRO of|VP at|VP of|VPs? Engineering|VPs? Product|works at|worked at|working at|employed by|employed at|joined as|joined the team|engineer at|engineer for|director at|director of|head of|heads up .{0,20} at|leads engineering|leads product|leads the .{0,20} (?:team|org) at|manages engineering at|manages product at|running (?:engineering|product|design) at|currently at|previously at|previously worked at|spent .* (?:years|months) at|stint at|stint as|tenure at|tenure as|role at|position at|(?:senior|staff|principal|lead|backend|frontend|full-?stack|ML|data|security) engineer at|promoted to (?:senior|staff|principal|lead) .{0,20} at|(?:his|her|their|my) time at)\b/i;
 
 // Investment context. Order patterns from most-specific to least to keep
 // regex efficient. Includes funding-round verbs ("led the seed", "led X's
@@ -370,13 +641,39 @@ const FOUNDED_RE = /\b(?:founded|co-?founded|started the company|incorporated|fo
 // Advise context: must be rooted in "advisor"/"advise" (investors also sit on
 // boards). Keep "board advisor" / "advisory board" but drop generic "board
 // member" / "sits on the board" which over-matches.
-const ADVISES_RE = /\b(?:advises|advised|advisor (?:to|at|for|of)|advisory (?:board|role|position)|board advisor|on .{0,20} advisory board|joined .{0,20} advisory board)\b/i;
+//
+// v0.10.5 additions (drive advises 41% → >85% on rich prose):
+//   - Advisory capacity phrasings: "in an advisory capacity", "advisory engagement",
+//     "advisory partnership", "advisory contract", "advisory relationship".
+//   - "as an advisor" form: joined/serves/brought on "as an advisor" / "as a
+//     security advisor" / "as a technical advisor" / "as an industry advisor".
+//   - "consults for / consulting role": advisor-adjacent verbs that appear in
+//     narratives where the direct "advises" verb isn't used.
+//   - Advisor-qualified: "strategic advisor to|at", "technical advisor to|at",
+//     "security advisor to|at", "product advisor to|at", "industry advisor".
+const ADVISES_RE = /\b(?:advises|advised|advisor (?:to|at|for|of)|advisory (?:board|role|position|capacity|engagement|partnership|contract|relationship|work)|board advisor|on .{0,20} advisory board|joined .{0,20} advisory board|in an? advisory (?:capacity|role|position)|as an? (?:advisor|security advisor|technical advisor|strategic advisor|industry advisor|product advisor|board advisor|senior advisor)|(?:strategic|technical|security|product|industry|senior|board) advisor (?:to|at|for|of)|consults for|consulting role (?:at|with))\b/i;
 
 // Page-role detection: if the source page describes a partner/investor at
 // page level, that's a strong prior for outbound company refs being
 // invested_in even when per-edge context lacks explicit investment verbs.
 const PARTNER_ROLE_RE = /\b(?:partner at|partner of|venture partner|VC partner|invested early|investor at|investor in|portfolio|venture capital|early-stage investor|seed investor|fund [A-Z]|invests across|backs companies)\b/i;
-const ADVISOR_ROLE_RE = /\b(?:full-time advisor|professional advisor|advises (?:multiple|several|various))\b/i;
+
+// Advisor role prior: fires when the page-level description indicates the
+// person IS an advisor (not just mentions advising). Broadened in v0.10.5
+// from "full-time/professional/advises multiple" to catch any page that
+// self-identifies the subject as an advisor.
+const ADVISOR_ROLE_RE = /\b(?:full-time advisor|professional advisor|advises (?:multiple|several|various)|is an? (?:advisor|security advisor|technical advisor|strategic advisor|industry advisor|product advisor|senior advisor)|took on advisory roles|(?:her|his|their) advisory (?:work|role|engagement|portfolio)|serves as (?:an )?advisor)\b/i;
+
+// Employee role prior (new in v0.10.5): fires when the page-level description
+// indicates the person IS an employee (senior/staff/lead engineer, director,
+// head, etc.) at some company. Biases outbound company refs on that page
+// toward works_at when per-edge verbs are absent (e.g. possessive phrasings
+// "her work on Delta's pipeline..." where the verb "works" doesn't appear
+// near the slug).
+//
+// Scope: only fires for person-page → company-page links. Companies' own
+// pages mentioning their employees use the page-role layer differently.
+const EMPLOYEE_ROLE_RE = /\b(?:is an? (?:senior|staff|principal|lead|backend|frontend|full-?stack|ML|data|security|DevOps|platform)? ?engineer at|is an? (?:senior|staff|principal|lead)? ?(?:developer|designer|product manager|engineering manager|director|VP) (?:at|of)|holds? the (?:CTO|CEO|CFO|COO|CMO|CRO|VP) (?:role|position|seat|title) at|is the (?:CTO|CEO|CFO|COO|CMO|CRO) of|employee at|on the team at|works on .{0,30} at)\b/i;
 
 /**
  * Infer link_type from page context. Deterministic regex heuristics, no LLM.
@@ -398,6 +695,11 @@ export function inferLinkType(pageType: PageType, context: string, globalContext
   if (pageType === 'media') {
     return 'mentions';
   }
+  // v0.27.1: image pages link to their text sibling via 'image_of' (the
+  // image is OF that meeting/note). Set explicitly by the import-image
+  // path-proximity helper, not by markdown extraction — but the type is
+  // declared here so graph-query knows the edge name.
+  if ((pageType as string) === 'image') return 'image_of';
   if ((pageType as string) === 'meeting') return 'attended';
   // Per-edge verb rules.
   if (FOUNDED_RE.test(context)) return 'founded';
@@ -408,9 +710,15 @@ export function inferLinkType(pageType: PageType, context: string, globalContext
   // about VC topics naturally contain "venture capital" in their text, but
   // their company refs are mentions, not investments. Partner pages mentioning
   // other people (co-investors, friends) should also stay as mentions.
+  //
+  // Precedence within priors: investor > advisor > employee. Investors often
+  // also sit on boards ("board seat at portfolio company") which a naive
+  // employee/advisor match would mis-classify; keep investor first so those
+  // phrasings resolve correctly.
   if (pageType === 'person' && globalContext && targetSlug?.startsWith('companies/')) {
     if (PARTNER_ROLE_RE.test(globalContext)) return 'invested_in';
     if (ADVISOR_ROLE_RE.test(globalContext)) return 'advises';
+    if (EMPLOYEE_ROLE_RE.test(globalContext)) return 'works_at';
   }
   return 'mentions';
 }
@@ -498,6 +806,67 @@ export interface SlugResolver {
    * extract/put_page summary so the user can see the gap.
    */
   resolve(name: string, dirHint?: string | string[]): Promise<string | null>;
+  /**
+   * Issue #972: return every slug whose basename (final `/`-segment, or
+   * the whole slug if it has no `/`) matches `name`. Multi-match by
+   * design — `[[struktura]]` referencing both `projects/struktura` and
+   * `archive/struktura` returns both; the caller emits one graph edge
+   * per result. Returns `[]` when no matches.
+   *
+   * Optional so existing SlugResolver consumers (e.g. synthetic
+   * frontmatter-only resolvers) keep working without code changes.
+   * Implementations should make this cheap to call repeatedly within
+   * a single extract run (build the index once, reuse it).
+   */
+  resolveBasenameMatches?(name: string): Promise<string[]>;
+}
+
+/**
+ * Issue #972 (codex [P2] DRY): the ONE basename matcher. Before this, three
+ * surfaces (makeResolver, FS `resolveBasenameMatchesFromSlugs`, the doctor
+ * `link_resolution_opportunity` check) each hand-rolled their own key set +
+ * sort, and they drifted — the doctor omitted the slugified key, so its
+ * "N would resolve" estimate undercounted what extraction actually produces.
+ * All three now build/query through these two functions so they cannot drift.
+ *
+ * Keying: raw tail + lowercase tail + slugified tail. A slug's tail is its
+ * final `/`-segment (or the whole slug when it has no `/`).
+ */
+export function normalizeBasename(s: string): string {
+  return s.toLowerCase().replace(/[^a-z0-9\s-]/g, '').trim().replace(/\s+/g, '-');
+}
+
+/** Stable order: shorter slug first (likely closer to brain root), then lexical. */
+function basenameSort(a: string, b: string): number {
+  return (a.length - b.length) || a.localeCompare(b);
+}
+
+/** Build a `key → slug[]` index over a slug collection. Keys: raw/lower/slugified tail. */
+export function buildBasenameIndex(slugs: Iterable<string>): Map<string, string[]> {
+  const idx = new Map<string, string[]>();
+  const addKey = (key: string, slug: string) => {
+    const existing = idx.get(key);
+    if (existing) { if (!existing.includes(slug)) existing.push(slug); }
+    else idx.set(key, [slug]);
+  };
+  for (const slug of slugs) {
+    const tail = slug.includes('/') ? slug.slice(slug.lastIndexOf('/') + 1) : slug;
+    addKey(tail, slug);
+    const lower = tail.toLowerCase();
+    if (lower !== tail) addKey(lower, slug);
+    const slugified = normalizeBasename(tail);
+    if (slugified && slugified !== tail && slugified !== lower) addKey(slugified, slug);
+  }
+  return idx;
+}
+
+/** Look a name up in a basename index (raw → lower → slugified), stable-sorted. */
+export function queryBasenameIndex(idx: Map<string, string[]>, name: string): string[] {
+  if (!name || typeof name !== 'string') return [];
+  const trimmed = name.trim();
+  if (!trimmed) return [];
+  const hit = idx.get(trimmed) ?? idx.get(trimmed.toLowerCase()) ?? idx.get(normalizeBasename(trimmed));
+  return hit ? [...hit].sort(basenameSort) : [];
 }
 
 /**
@@ -517,13 +886,52 @@ export interface SlugResolver {
  */
 export function makeResolver(
   engine: BrainEngine,
-  opts: { mode: 'batch' | 'live' } = { mode: 'live' },
+  opts: { mode: 'batch' | 'live'; sourceId?: string } = { mode: 'live' },
 ): SlugResolver {
   const cache = new Map<string, string | null>();
 
   const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9\s-]/g, '').trim().replace(/\s+/g, '-');
 
+  // Issue #972: lazy-built basename → slug[] index for global-basename
+  // resolution. Built on first call to `resolveBasenameMatches`; reused
+  // for the rest of the resolver instance's lifetime. Cost is bounded
+  // (one `engine.getAllSlugs()` call per extract run / put_page). The
+  // index keys BOTH the raw tail and the slugified-tail so a wikilink
+  // `[[Fast-Weigh]]` matches a page slugged `companies/fast-weigh` as
+  // well as `notes/Fast-Weigh`.
+  let basenameIndex: Map<string, string[]> | null = null;
+  async function ensureBasenameIndex(): Promise<Map<string, string[]>> {
+    if (basenameIndex !== null) return basenameIndex;
+    const idx = new Map<string, string[]>();
+    if (typeof engine.getAllSlugs !== 'function') {
+      basenameIndex = idx;
+      return idx;
+    }
+    try {
+      // Issue #972 (codex [P1]): scope the basename index to the resolver's
+      // source. getAllSlugs({sourceId}) keeps wikilink resolution from
+      // spanning unrelated sources — a bare [[name]] must NOT resolve to a
+      // same-tail page in a DIFFERENT source and create a cross-source edge.
+      // #972 is "global basename across folders," not "cross-source federation."
+      const all = await engine.getAllSlugs(opts.sourceId ? { sourceId: opts.sourceId } : undefined);
+      // Issue #972 (codex [P2] DRY): one shared index builder for all surfaces.
+      basenameIndex = buildBasenameIndex(all);
+      return basenameIndex;
+    } catch {
+      // Index build failed — empty map → resolveBasenameMatches finds
+      // nothing, resolver continues as if the flag was off. Never throw.
+    }
+    basenameIndex = idx;
+    return idx;
+  }
+
   return {
+    async resolveBasenameMatches(name: string): Promise<string[]> {
+      // Issue #972 (codex [P2] DRY): shared query so resolver + FS + doctor
+      // return the same matches in the same stable order.
+      return queryBasenameIndex(await ensureBasenameIndex(), name);
+    },
+
     async resolve(name: string, dirHint?: string | string[]): Promise<string | null> {
       if (!name || typeof name !== 'string') return null;
       const trimmed = name.trim();
@@ -790,4 +1198,32 @@ export async function isAutoTimelineEnabled(engine: BrainEngine): Promise<boolea
   if (val == null) return true;
   const normalized = val.trim().toLowerCase();
   return !['false', '0', 'no', 'off'].includes(normalized);
+}
+
+/**
+ * Read the `link_resolution.global_basename` config flag. Defaults to
+ * FALSE (opt-in only; existing brains keep ancestor-walk resolution).
+ *
+ * When TRUE: bare wikilinks like `[[struktura]]` (no DIR_PATTERN prefix)
+ * that don't resolve via the existing path are matched against every
+ * page's basename. Each unique match emits a graph edge tagged
+ * `linkType: 'wikilink_basename'`. Multiple matches emit multiple edges.
+ *
+ * Resolution order (highest → lowest):
+ *   1. Env var `GBRAIN_LINK_RESOLUTION_GLOBAL_BASENAME=1` (operator override)
+ *   2. DB plane via `engine.getConfig('link_resolution.global_basename')`
+ *   3. Default false
+ *
+ * Closes https://github.com/garrytan/gbrain/issues/972.
+ */
+export async function isGlobalBasenameEnabled(engine: BrainEngine): Promise<boolean> {
+  const envVal = process.env.GBRAIN_LINK_RESOLUTION_GLOBAL_BASENAME;
+  if (envVal != null) {
+    const normalized = envVal.trim().toLowerCase();
+    return ['1', 'true', 'yes', 'on'].includes(normalized);
+  }
+  const val = await engine.getConfig('link_resolution.global_basename');
+  if (val == null) return false;
+  const normalized = val.trim().toLowerCase();
+  return ['1', 'true', 'yes', 'on'].includes(normalized);
 }

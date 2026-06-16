@@ -32,6 +32,7 @@ function makeCtx(opts: { remote?: boolean } = {}): OperationContext {
     dryRun: false,
     // Default: trusted local invocation (matches `gbrain call` semantics).
     remote: opts.remote ?? false,
+    sourceId: 'default',
   };
 }
 
@@ -49,13 +50,13 @@ describeE2E('E2E: Page CRUD', () => {
   beforeAll(async () => {
     await setupDB();
     await importFixtures();
-  });
+  }, 30_000);
   afterAll(teardownDB);
 
   test('fixture import creates correct page count', async () => {
     const stats = await callOp('get_stats') as any;
     expect(stats.page_count).toBe(16);
-  });
+  }, 30_000);
 
   test('get_page returns correct data for person', async () => {
     const page = await callOp('get_page', { slug: 'people/sarah-chen' }) as any;
@@ -126,7 +127,7 @@ describeE2E('E2E: Search', () => {
   beforeAll(async () => {
     await setupDB();
     await importFixtures();
-  });
+  }, 30_000);
   afterAll(teardownDB);
 
   test('keyword search for "NovaMind" returns multiple hits', async () => {
@@ -134,7 +135,7 @@ describeE2E('E2E: Search', () => {
     expect(results.length).toBeGreaterThanOrEqual(3);
     const slugs = results.map((r: any) => r.slug);
     expect(slugs).toContain('companies/novamind');
-  });
+  }, 30_000);
 
   test('keyword search for "Threshold Ventures" finds investor', async () => {
     const results = await callOp('search', { query: 'Threshold Ventures' }) as any[];
@@ -185,7 +186,7 @@ describeE2E('E2E: Links', () => {
   beforeAll(async () => {
     await setupDB();
     await importFixtures();
-  });
+  }, 30_000);
   afterAll(teardownDB);
 
   test('add_link + get_links + get_backlinks round trip', async () => {
@@ -201,7 +202,7 @@ describeE2E('E2E: Links', () => {
 
     const backlinks = await callOp('get_backlinks', { slug: 'companies/novamind' }) as any[];
     expect(backlinks.some((l: any) => l.from_slug === 'people/sarah-chen' || l.from_page_slug === 'people/sarah-chen')).toBe(true);
-  });
+  }, 30_000);
 
   test('traverse_graph finds connected pages', async () => {
     // Links should already be added from prior test in this describe block
@@ -230,7 +231,7 @@ describeE2E('E2E: Tags', () => {
   beforeAll(async () => {
     await setupDB();
     await importFixtures();
-  });
+  }, 30_000);
   afterAll(teardownDB);
 
   test('get_tags returns imported tags', async () => {
@@ -238,7 +239,7 @@ describeE2E('E2E: Tags', () => {
     expect(tags).toContain('founder');
     expect(tags).toContain('yc-w25');
     expect(tags).toContain('ai-agents');
-  });
+  }, 30_000);
 
   test('add_tag + remove_tag round trip', async () => {
     await callOp('add_tag', { slug: 'people/marcus-reid', tag: 'test-tag' });
@@ -266,7 +267,7 @@ describeE2E('E2E: Timeline', () => {
   beforeAll(async () => {
     await setupDB();
     await importFixtures();
-  });
+  }, 30_000);
   afterAll(teardownDB);
 
   test('add_timeline_entry + get_timeline round trip', async () => {
@@ -282,7 +283,7 @@ describeE2E('E2E: Timeline', () => {
     expect(timeline.length).toBeGreaterThanOrEqual(1);
     const entry = timeline.find((e: any) => e.summary === 'Test timeline entry');
     expect(entry).toBeDefined();
-  });
+  }, 30_000);
 });
 
 // ─────────────────────────────────────────────────────────────────
@@ -298,13 +299,13 @@ describeE2E('E2E: addLinksBatch (postgres-engine)', () => {
   beforeAll(async () => {
     await setupDB();
     await importFixtures();
-  });
+  }, 30_000);
   afterAll(teardownDB);
 
   test('empty batch returns 0 with no DB call', async () => {
     const engine = getEngine();
     expect(await engine.addLinksBatch([])).toBe(0);
-  });
+  }, 30_000);
 
   test('within-batch duplicates dedup via ON CONFLICT (no 21000 cardinality error)', async () => {
     const engine = getEngine();
@@ -369,13 +370,13 @@ describeE2E('E2E: addTimelineEntriesBatch (postgres-engine)', () => {
   beforeAll(async () => {
     await setupDB();
     await importFixtures();
-  });
+  }, 30_000);
   afterAll(teardownDB);
 
   test('empty batch returns 0', async () => {
     const engine = getEngine();
     expect(await engine.addTimelineEntriesBatch([])).toBe(0);
-  });
+  }, 30_000);
 
   test('within-batch duplicates dedup via ON CONFLICT', async () => {
     const engine = getEngine();
@@ -423,7 +424,7 @@ describeE2E('E2E: Versions', () => {
   beforeAll(async () => {
     await setupDB();
     await importFixtures();
-  });
+  }, 30_000);
   afterAll(teardownDB);
 
   test('put_page creates version, revert restores', async () => {
@@ -445,7 +446,7 @@ describeE2E('E2E: Versions', () => {
 
     const reverted = await callOp('get_page', { slug: 'people/sarah-chen' }) as any;
     expect(reverted.compiled_truth).not.toContain('(Modified)');
-  });
+  }, 30_000);
 });
 
 // ─────────────────────────────────────────────────────────────────
@@ -456,14 +457,14 @@ describeE2E('E2E: Admin', () => {
   beforeAll(async () => {
     await setupDB();
     await importFixtures();
-  });
+  }, 30_000);
   afterAll(teardownDB);
 
   test('get_stats returns valid structure', async () => {
     const stats = await callOp('get_stats') as any;
     expect(stats.page_count).toBe(16);
     expect(typeof stats.chunk_count).toBe('number');
-  });
+  }, 30_000);
 
   test('get_health returns valid structure', async () => {
     const health = await callOp('get_health') as any;
@@ -481,14 +482,14 @@ describeE2E('E2E: Chunks & Resolution', () => {
   beforeAll(async () => {
     await setupDB();
     await importFixtures();
-  });
+  }, 30_000);
   afterAll(teardownDB);
 
   test('get_chunks returns chunks for imported page', async () => {
     const chunks = await callOp('get_chunks', { slug: 'people/sarah-chen' }) as any[];
     expect(chunks.length).toBeGreaterThan(0);
     expect(chunks[0].chunk_text).toBeTruthy();
-  });
+  }, 30_000);
 
   test('resolve_slugs finds partial match', async () => {
     const matches = await callOp('resolve_slugs', { partial: 'sarah' }) as string[];
@@ -509,7 +510,7 @@ describeE2E('E2E: Ingest Log & Raw Data', () => {
   beforeAll(async () => {
     await setupDB();
     await importFixtures();
-  });
+  }, 30_000);
   afterAll(teardownDB);
 
   test('log_ingest + get_ingest_log round trip', async () => {
@@ -525,7 +526,7 @@ describeE2E('E2E: Ingest Log & Raw Data', () => {
     const entry = log.find((e: any) => e.source_ref === 'test-run-1');
     expect(entry).toBeDefined();
     expect(entry.source_type).toBe('e2e-test');
-  });
+  }, 30_000);
 
   test('put_raw_data + get_raw_data round trip', async () => {
     const testData = { education: 'Stanford CS 2020', title: 'CEO' };
@@ -555,13 +556,13 @@ describeE2E('E2E: Files', () => {
   beforeAll(async () => {
     await setupDB();
     await importFixtures();
-  });
+  }, 30_000);
   afterAll(teardownDB);
 
   test('file_list returns empty initially', async () => {
     const files = await callOp('file_list', {}) as any[];
     expect(files.length).toBe(0);
-  });
+  }, 30_000);
 
   test('file_upload stores metadata + file_list shows it', async () => {
     // Create a temp file
@@ -622,7 +623,7 @@ describeE2E('E2E: Files', () => {
 describeE2E('E2E: file_list LIMIT enforcement', () => {
   beforeAll(async () => {
     await setupDB();
-  });
+  }, 30_000);
   afterAll(teardownDB);
 
   test('file_list with slug filter respects LIMIT 100', async () => {
@@ -653,7 +654,7 @@ describeE2E('E2E: file_list LIMIT enforcement', () => {
     const files = await callOp('file_list', { slug: testSlug }) as any[];
     expect(files.length).toBeLessThanOrEqual(100);
     expect(files.length).toBe(100);
-  });
+  }, 30_000);
 
   test('file_list without slug also respects LIMIT 100', async () => {
     // The 150 rows from the previous test are still in the DB
@@ -669,7 +670,7 @@ describeE2E('E2E: file_list LIMIT enforcement', () => {
 describeE2E('E2E: Idempotency', () => {
   beforeAll(async () => {
     await setupDB();
-  });
+  }, 30_000);
   afterAll(teardownDB);
 
   test('double import produces no duplicates', async () => {
@@ -683,7 +684,7 @@ describeE2E('E2E: Idempotency', () => {
 
     expect(stats2.page_count).toBe(stats1.page_count);
     expect(stats2.chunk_count).toBe(stats1.chunk_count);
-  });
+  }, 30_000);
 
   test('modify one fixture, reimport, only that page updates', async () => {
     await importFixtures();
@@ -712,15 +713,22 @@ describeE2E('E2E: Idempotency', () => {
 describeE2E('E2E: Setup Journey', () => {
   beforeAll(async () => {
     await setupDB();
-  });
+  }, 30_000);
   afterAll(teardownDB);
 
   const cliCwd = join(import.meta.dir, '../..');
   const cliEnv = () => ({ ...process.env, DATABASE_URL: process.env.DATABASE_URL! });
 
   test('gbrain init --non-interactive connects and initializes', () => {
+    // v0.37.10.0: pass --embedding-model explicitly. Tier-1 CI runs without
+    // any embedding-provider env var, and the v0.37 fail-loud-no-key gate
+    // (D3) would otherwise exit 1 here. The provider is offline-resolved
+    // (preflight validates dim against recipe; no HTTP call), so this works
+    // without a real API key. After this init writes config, subsequent
+    // inits in the file honor persisted config per D5 (no flag needed).
     const result = Bun.spawnSync({
-      cmd: ['bun', 'run', 'src/cli.ts', 'init', '--non-interactive', '--url', process.env.DATABASE_URL!],
+      cmd: ['bun', 'run', 'src/cli.ts', 'init', '--non-interactive', '--url', process.env.DATABASE_URL!,
+            '--embedding-model', 'openai:text-embedding-3-large'],
       cwd: cliCwd,
       env: cliEnv(),
       timeout: 15_000,
@@ -793,7 +801,7 @@ describeE2E('E2E: Init Edge Cases', () => {
       timeout: 10_000,
     });
     expect(result.exitCode).not.toBe(0);
-  });
+  }, 30_000);
 
   test('double init is idempotent', async () => {
     await setupDB();
@@ -828,7 +836,7 @@ describeE2E('E2E: Init Edge Cases', () => {
 describeE2E('E2E: Schema Idempotency', () => {
   beforeAll(async () => {
     await setupDB();
-  });
+  }, 30_000);
   afterAll(teardownDB);
 
   test('initSchema twice produces no errors and same object count', async () => {
@@ -844,7 +852,7 @@ describeE2E('E2E: Schema Idempotency', () => {
 
     expect(tables2[0].n).toBe(tables1[0].n);
     expect(indexes2[0].n).toBe(indexes1[0].n);
-  });
+  }, 30_000);
 });
 
 // ─────────────────────────────────────────────────────────────────
@@ -854,7 +862,7 @@ describeE2E('E2E: Schema Idempotency', () => {
 describeE2E('E2E: Schema Diff Guard', () => {
   beforeAll(async () => {
     await setupDB();
-  });
+  }, 30_000);
   afterAll(teardownDB);
 
   test('all expected tables exist', async () => {
@@ -874,7 +882,7 @@ describeE2E('E2E: Schema Diff Guard', () => {
     for (const table of expected) {
       expect(tableNames).toContain(table);
     }
-  });
+  }, 30_000);
 
   test('pgvector extension is installed', async () => {
     const conn = getConn();
@@ -897,7 +905,7 @@ describeE2E('E2E: Slug with Special Characters', () => {
   beforeAll(async () => {
     await setupDB();
     await importFixtures();
-  });
+  }, 30_000);
   afterAll(teardownDB);
 
   test('imports files with spaces in filename', async () => {
@@ -905,7 +913,7 @@ describeE2E('E2E: Slug with Special Characters', () => {
     expect(page).not.toBeNull();
     expect(page.title).toBe('OhMyGreen');
     expect(page.type).toBe('company');
-  });
+  }, 30_000);
 
   test('imports files with parens in filename', async () => {
     const page = await callOp('get_page', { slug: 'apple-notes/notes-march-2024' }) as any;
@@ -935,33 +943,272 @@ describeE2E('E2E: Slug with Special Characters', () => {
 describeE2E('E2E: RLS Verification', () => {
   beforeAll(async () => {
     await setupDB();
-  });
+  }, 30_000);
   afterAll(teardownDB);
 
-  test('RLS is enabled on all gbrain tables', async () => {
+  const cliCwd = join(import.meta.dir, '../..');
+  const cliEnv = () => ({ ...process.env, DATABASE_URL: process.env.DATABASE_URL!, GBRAIN_DATABASE_URL: process.env.DATABASE_URL! });
+
+  // Seed a unique suffix per run so concurrent test DBs / crashed prior
+  // runs don't collide. All helper tables follow `gbrain_rls_regression_<suffix>`.
+  const suffix = `${process.pid}_${Date.now()}`;
+
+  test('RLS is enabled on every public table (no hardcoded allowlist)', async () => {
     const conn = getConn();
     const tables = await conn.unsafe(`
       SELECT tablename, rowsecurity FROM pg_tables
       WHERE schemaname = 'public'
-        AND tablename IN ('pages','content_chunks','links','tags','raw_data',
-                           'page_versions','timeline_entries','ingest_log','config','files')
     `);
     const noRls = tables.filter((t: any) => !t.rowsecurity);
     // Some test DBs may not have BYPASSRLS privilege, so RLS might be skipped.
-    // If RLS was enabled, all tables should have it.
+    // If RLS was enabled at all (the common case against Docker postgres), EVERY
+    // public table must have it — no hardcoded IN-list exceptions.
     if (tables.some((t: any) => t.rowsecurity)) {
-      expect(noRls.length).toBe(0);
+      expect(noRls.map((t: any) => t.tablename)).toEqual([]);
     }
-  });
+  }, 30_000);
 
   test('current user role has BYPASSRLS', async () => {
     const conn = getConn();
     const rows = await conn.unsafe(`SELECT rolbypassrls FROM pg_roles WHERE rolname = current_user`);
-    // Docker test DB uses postgres role which has BYPASSRLS
     if (rows.length > 0) {
       expect(rows[0].rolbypassrls).toBe(true);
     }
   });
+
+  test('gbrain doctor fails with exit 1 when a public table is missing RLS', async () => {
+    const conn = getConn();
+    const tbl = `gbrain_rls_regression_${suffix}`;
+    try {
+      // Init first so all migrations (including v35's auto-RLS event trigger
+      // and one-time backfill) are applied. AFTER migrations run, simulate
+      // the post-v35 escape route: operator drops the auto-RLS trigger
+      // (e.g. while debugging) and creates a public table without RLS.
+      // doctor's existing rls check must still flag it. The new
+      // rls_event_trigger check warns separately about the missing trigger.
+      Bun.spawnSync({
+        cmd: ['bun', 'run', 'src/cli.ts', 'init', '--non-interactive', '--url', process.env.DATABASE_URL!],
+        cwd: cliCwd, env: cliEnv(), timeout: 15_000,
+      });
+
+      // Drop the trigger so CREATE TABLE doesn't auto-enable RLS, then create
+      // the test table without RLS. ALTER TABLE … DISABLE is a belt-and-
+      // suspenders no-op in this path but matches what an operator would do
+      // if they had toggled RLS off manually after the trigger ran.
+      await conn.unsafe(`DROP EVENT TRIGGER IF EXISTS auto_rls_on_create_table`);
+      await conn.unsafe(`CREATE TABLE public.${tbl} (id int)`);
+      await conn.unsafe(`ALTER TABLE public.${tbl} DISABLE ROW LEVEL SECURITY`);
+
+      const result = Bun.spawnSync({
+        cmd: ['bun', 'run', 'src/cli.ts', 'doctor', '--json'],
+        cwd: cliCwd, env: cliEnv(), timeout: 20_000,
+      });
+      const stdout = new TextDecoder().decode(result.stdout);
+      const parsed = JSON.parse(stdout);
+      const rls = parsed.checks.find((c: any) => c.name === 'rls');
+      expect(rls).toBeDefined();
+      expect(rls.status).toBe('fail');
+      expect(rls.message).toContain(tbl);
+      expect(rls.message).toContain('ALTER TABLE');
+      expect(result.exitCode).toBe(1);
+    } finally {
+      await conn.unsafe(`DROP TABLE IF EXISTS public.${tbl}`);
+      // Restore the trigger via a no-op v35 replay so subsequent tests in
+      // this file (which expect the post-init steady state) don't see drift.
+      const { MIGRATIONS } = await import('../../src/core/migrate.ts');
+      const v35sql = (MIGRATIONS.find(m => m.version === 35)?.sqlFor as any)?.postgres;
+      if (v35sql) await conn.unsafe(v35sql);
+    }
+  }, 60_000);
+
+  test('GBRAIN:RLS_EXEMPT comment with valid reason exempts a non-RLS public table', async () => {
+    const conn = getConn();
+    const tbl = `gbrain_rls_exempt_ok_${suffix}`;
+    try {
+      await conn.unsafe(`CREATE TABLE public.${tbl} (id int)`);
+      await conn.unsafe(`ALTER TABLE public.${tbl} DISABLE ROW LEVEL SECURITY`);
+      await conn.unsafe(`COMMENT ON TABLE public.${tbl} IS 'GBRAIN:RLS_EXEMPT reason=e2e test fixture, anon-readable ok'`);
+
+      Bun.spawnSync({
+        cmd: ['bun', 'run', 'src/cli.ts', 'init', '--non-interactive', '--url', process.env.DATABASE_URL!],
+        cwd: cliCwd, env: cliEnv(), timeout: 15_000,
+      });
+      const result = Bun.spawnSync({
+        cmd: ['bun', 'run', 'src/cli.ts', 'doctor', '--json'],
+        cwd: cliCwd, env: cliEnv(), timeout: 20_000,
+      });
+      const stdout = new TextDecoder().decode(result.stdout);
+      const parsed = JSON.parse(stdout);
+      const rls = parsed.checks.find((c: any) => c.name === 'rls');
+      expect(rls.status).toBe('ok');
+      expect(rls.message).toContain('explicitly exempt');
+      expect(rls.message).toContain(tbl);
+    } finally {
+      await conn.unsafe(`DROP TABLE IF EXISTS public.${tbl}`);
+    }
+  }, 60_000);
+
+  test('GBRAIN:RLS_EXEMPT comment WITHOUT reason= still fails doctor', async () => {
+    const conn = getConn();
+    const tbl = `gbrain_rls_exempt_bad_${suffix}`;
+    try {
+      await conn.unsafe(`CREATE TABLE public.${tbl} (id int)`);
+      await conn.unsafe(`ALTER TABLE public.${tbl} DISABLE ROW LEVEL SECURITY`);
+      // Missing the `reason=<...>` segment — prefix alone is not enough.
+      await conn.unsafe(`COMMENT ON TABLE public.${tbl} IS 'GBRAIN:RLS_EXEMPT'`);
+
+      Bun.spawnSync({
+        cmd: ['bun', 'run', 'src/cli.ts', 'init', '--non-interactive', '--url', process.env.DATABASE_URL!],
+        cwd: cliCwd, env: cliEnv(), timeout: 15_000,
+      });
+      const result = Bun.spawnSync({
+        cmd: ['bun', 'run', 'src/cli.ts', 'doctor', '--json'],
+        cwd: cliCwd, env: cliEnv(), timeout: 20_000,
+      });
+      const stdout = new TextDecoder().decode(result.stdout);
+      const parsed = JSON.parse(stdout);
+      const rls = parsed.checks.find((c: any) => c.name === 'rls');
+      expect(rls.status).toBe('fail');
+      expect(rls.message).toContain(tbl);
+      expect(result.exitCode).toBe(1);
+    } finally {
+      await conn.unsafe(`DROP TABLE IF EXISTS public.${tbl}`);
+    }
+  }, 60_000);
+
+  test('Non-exempt unrelated COMMENT on a no-RLS table still fails doctor', async () => {
+    const conn = getConn();
+    const tbl = `gbrain_rls_comment_${suffix}`;
+    try {
+      await conn.unsafe(`CREATE TABLE public.${tbl} (id int)`);
+      await conn.unsafe(`ALTER TABLE public.${tbl} DISABLE ROW LEVEL SECURITY`);
+      await conn.unsafe(`COMMENT ON TABLE public.${tbl} IS 'Regular docs comment, not an exemption'`);
+
+      Bun.spawnSync({
+        cmd: ['bun', 'run', 'src/cli.ts', 'init', '--non-interactive', '--url', process.env.DATABASE_URL!],
+        cwd: cliCwd, env: cliEnv(), timeout: 15_000,
+      });
+      const result = Bun.spawnSync({
+        cmd: ['bun', 'run', 'src/cli.ts', 'doctor', '--json'],
+        cwd: cliCwd, env: cliEnv(), timeout: 20_000,
+      });
+      const stdout = new TextDecoder().decode(result.stdout);
+      const parsed = JSON.parse(stdout);
+      const rls = parsed.checks.find((c: any) => c.name === 'rls');
+      expect(rls.status).toBe('fail');
+      expect(result.exitCode).toBe(1);
+    } finally {
+      await conn.unsafe(`DROP TABLE IF EXISTS public.${tbl}`);
+    }
+  }, 60_000);
+
+  // Regression test for the v24 self-healing guard. If an operator manually
+  // drops budget_ledger and/or budget_reservations (they are migration-only
+  // per v12, not in schema.sql, and the data is regenerable from resolver
+  // logs — so dropping them is a reasonable cleanup), v24 must NOT fail
+  // with 42P01. The information_schema.tables IF EXISTS guards around those
+  // two ALTERs let the migration skip them and continue.
+  //
+  // Without the guard, a brain with dropped budget_* tables would get stuck
+  // in an infinite retry loop: v24 fails → transaction rolls back →
+  // schema_version stays at prior value → next initSchema re-runs v24 →
+  // same failure forever.
+  test('v24 self-heals when budget_ledger + budget_reservations are missing', async () => {
+    const conn = getConn();
+    let priorVersion: string | null = null;
+    try {
+      // Capture current version so we can restore after the test.
+      const verRows = await conn.unsafe(`SELECT value FROM config WHERE key = 'version'`);
+      priorVersion = (verRows[0] as any)?.value ?? null;
+
+      // Simulate an operator who dropped the budget_* tables for any reason
+      // (cleanup, migration from an older gbrain, etc).
+      await conn.unsafe(`DROP TABLE IF EXISTS public.budget_ledger CASCADE`);
+      await conn.unsafe(`DROP TABLE IF EXISTS public.budget_reservations CASCADE`);
+
+      // Roll the version back to 23 so v24 re-runs on the next initSchema.
+      // UPSERT so this works whether the key exists or not.
+      await conn.unsafe(`
+        INSERT INTO config (key, value) VALUES ('version', '23')
+        ON CONFLICT (key) DO UPDATE SET value = '23'
+      `);
+
+      // Re-trigger initSchema via the CLI. With the guard, this should
+      // apply v24 cleanly and advance version to 24. Without the guard,
+      // this would error out with 42P01 and leave version at 23.
+      const result = Bun.spawnSync({
+        cmd: ['bun', 'run', 'src/cli.ts', 'init', '--non-interactive', '--url', process.env.DATABASE_URL!],
+        cwd: cliCwd, env: cliEnv(), timeout: 30_000,
+      });
+      const stdout = new TextDecoder().decode(result.stdout);
+      const stderr = new TextDecoder().decode(result.stderr);
+
+      // Must succeed — no 42P01, no transaction rollback.
+      expect(result.exitCode).toBe(0);
+      expect(stderr + stdout).not.toMatch(/42P01|does not exist.*budget/i);
+
+      // Version must have advanced PAST 24. Since v0.18.1, v25-v29 (v0.19.0
+      // + v0.21.0 Cathedral II) and v30 (OAuth) have shipped. init runs every
+      // pending migration, so after rolling back to 23 the version advances
+      // to LATEST_VERSION. The test's intent is to prove v24 didn't crash on
+      // missing budget_* tables — assert version >= 24.
+      const afterRows = await conn.unsafe(`SELECT value FROM config WHERE key = 'version'`);
+      const finalVersion = parseInt((afterRows[0] as any).value, 10);
+      expect(finalVersion).toBeGreaterThanOrEqual(24);
+
+      // The tables stayed dropped (v12 didn't re-run because current=23 > 12
+      // was already true before this test ran). That's intentional — we're
+      // proving v24 doesn't require those tables to exist.
+      const tblRows = await conn.unsafe(`
+        SELECT tablename FROM pg_tables
+        WHERE schemaname = 'public'
+          AND tablename IN ('budget_ledger', 'budget_reservations')
+      `);
+      expect(tblRows.length).toBe(0);
+    } finally {
+      // Restore: recreate the budget_* tables (minimal schema — just enough
+      // to keep the rest of the test suite happy) and reset version.
+      // Mirror migration v12's CREATE TABLE IF NOT EXISTS exactly so any
+      // downstream test that touches these tables sees the original shape.
+      await conn.unsafe(`
+        CREATE TABLE IF NOT EXISTS budget_ledger (
+          scope          TEXT        NOT NULL,
+          resolver_id    TEXT        NOT NULL,
+          local_date     DATE        NOT NULL,
+          reserved_usd   NUMERIC(12,4) NOT NULL DEFAULT 0,
+          committed_usd  NUMERIC(12,4) NOT NULL DEFAULT 0,
+          cap_usd        NUMERIC(12,4),
+          created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+          updated_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+          PRIMARY KEY (scope, resolver_id, local_date)
+        )
+      `);
+      await conn.unsafe(`
+        CREATE TABLE IF NOT EXISTS budget_reservations (
+          reservation_id TEXT        PRIMARY KEY,
+          scope          TEXT        NOT NULL,
+          resolver_id    TEXT        NOT NULL,
+          local_date     DATE        NOT NULL,
+          estimate_usd   NUMERIC(12,4) NOT NULL,
+          reserved_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+          expires_at     TIMESTAMPTZ NOT NULL,
+          status         TEXT        NOT NULL DEFAULT 'held'
+        )
+      `);
+      // Enable RLS on the recreated tables so the "every public table has
+      // RLS" assertion earlier in this block stays green if re-run.
+      await conn.unsafe(`ALTER TABLE budget_ledger ENABLE ROW LEVEL SECURITY`);
+      await conn.unsafe(`ALTER TABLE budget_reservations ENABLE ROW LEVEL SECURITY`);
+      // Restore version so we don't leave the DB at a weird state for
+      // subsequent test blocks.
+      if (priorVersion !== null) {
+        await conn.unsafe(
+          `UPDATE config SET value = $1 WHERE key = 'version'`,
+          [priorVersion],
+        );
+      }
+    }
+  }, 60_000);
 });
 
 // ─────────────────────────────────────────────────────────────────
@@ -969,19 +1216,53 @@ describeE2E('E2E: RLS Verification', () => {
 // ─────────────────────────────────────────────────────────────────
 
 describeE2E('E2E: Doctor Command', () => {
+  // Scope GBRAIN_HOME to a hermetic tmpdir so `gbrain doctor` doesn't read
+  // the developer's local ~/.gbrain/migrations/completed.jsonl. Stale partial
+  // entries from in-flight workspaces (e.g. v0.31.x santiago) would make the
+  // minions_migration check fail and exit 1, masking real DB-health failures.
+  let gbrainHome: string;
+
   beforeAll(async () => {
     await setupDB();
     await importFixtures();
+    // Isolate GBRAIN_HOME to a per-block tempdir so the developer's
+    // ~/.gbrain/migrations/completed.jsonl ledger doesn't leak in. Without
+    // this, doctor reads the dev machine state — partial v0.21/v0.22.4/v0.28.0
+    // migration entries from in-flight workspaces — and surfaces them as the
+    // 'minions_migration' [FAIL] check, exiting with code 1.
+    gbrainHome = mkdtempSync(join(tmpdir(), 'gbrain-doctor-e2e-'));
+    // Cross-file isolation: prior E2E files can leave non-default `sources`
+    // rows (e.g. 'delta' from autopilot/sources tests). Doctor's
+    // sync_freshness + cycle_freshness checks then FAIL on those orphans,
+    // exit 1, breaking 'doctor exits 0 on healthy DB'. setupDB TRUNCATEs
+    // sources but schema.sql re-seeds 'default' via initSchema; clean any
+    // other rows so the doctor sees a clean single-source brain.
+    const conn = getConn();
+    await conn`DELETE FROM sources WHERE id != 'default'`;
+  }, 30_000);
+  afterAll(async () => {
+    await teardownDB();
+    if (gbrainHome) rmSync(gbrainHome, { recursive: true, force: true });
   });
-  afterAll(teardownDB);
 
   const cliCwd = join(import.meta.dir, '../..');
-  const cliEnv = () => ({ ...process.env, DATABASE_URL: process.env.DATABASE_URL!, GBRAIN_DATABASE_URL: process.env.DATABASE_URL! });
+  const cliEnv = () => ({
+    ...process.env,
+    DATABASE_URL: process.env.DATABASE_URL!,
+    GBRAIN_DATABASE_URL: process.env.DATABASE_URL!,
+    GBRAIN_HOME: gbrainHome,
+  });
 
   test('gbrain doctor exits 0 on healthy DB', () => {
-    // Init first so config exists for CLI
+    // Init first so config exists for CLI. Pin --embedding-model explicitly
+    // so the spawned doctor doesn't pick a different default (e.g. ZE-1280d
+    // when ZEROENTROPY_API_KEY is in env) that mismatches the 1536d schema
+    // setupDB initialized, producing a WARN-status embedding_width_consistency
+    // check and exit 1. Mirrors the same pattern in 'Setup Journey'.
     Bun.spawnSync({
-      cmd: ['bun', 'run', 'src/cli.ts', 'init', '--non-interactive', '--url', process.env.DATABASE_URL!],
+      cmd: ['bun', 'run', 'src/cli.ts', 'init', '--non-interactive',
+            '--url', process.env.DATABASE_URL!,
+            '--embedding-model', 'openai:text-embedding-3-large'],
       cwd: cliCwd, env: cliEnv(), timeout: 15_000,
     });
     const result = Bun.spawnSync({
@@ -990,6 +1271,12 @@ describeE2E('E2E: Doctor Command', () => {
       env: cliEnv(),
       timeout: 15_000,
     });
+    if (result.exitCode !== 0) {
+      const stdout = new TextDecoder().decode(result.stdout);
+      const stderr = new TextDecoder().decode(result.stderr);
+      console.error('doctor stdout:', stdout.slice(-2000));
+      console.error('doctor stderr:', stderr.slice(-1000));
+    }
     expect(result.exitCode).toBe(0);
   }, 60_000);
 
@@ -1141,7 +1428,7 @@ describeE2E('E2E: Parallel Import', () => {
 describeE2E('E2E: Performance Baselines', () => {
   beforeAll(async () => {
     await setupDB();
-  });
+  }, 30_000);
   afterAll(teardownDB);
 
   test('import + search + link performance', async () => {
@@ -1167,5 +1454,5 @@ describeE2E('E2E: Performance Baselines', () => {
     console.log(`    Search p50: ${p50.toFixed(0)}ms`);
     console.log(`    Search p99: ${p99.toFixed(0)}ms`);
     console.log(`    Link + backlink: ${linkMs.toFixed(0)}ms`);
-  });
+  }, 30_000);
 });

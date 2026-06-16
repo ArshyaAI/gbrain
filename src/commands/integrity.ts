@@ -25,12 +25,12 @@
  */
 
 import { appendFileSync, existsSync, readFileSync, mkdirSync, writeFileSync } from 'fs';
-import { homedir } from 'os';
-import { join, dirname } from 'path';
+import { dirname } from 'path';
 
-import { loadConfig, toEngineConfig } from '../core/config.ts';
+import { loadConfig, toEngineConfig, gbrainPath } from '../core/config.ts';
 import { createEngine } from '../core/engine-factory.ts';
 import type { BrainEngine } from '../core/engine.ts';
+import * as db from '../core/db.ts';
 import { BrainWriter } from '../core/output/writer.ts';
 import {
   getDefaultRegistry,
@@ -44,10 +44,10 @@ import { tweetCitation } from '../core/output/scaffold.ts';
 // Paths
 // ---------------------------------------------------------------------------
 
-const GBRAIN_DIR = join(homedir(), '.gbrain');
-const REVIEW_FILE = join(GBRAIN_DIR, 'integrity-review.md');
-const LOG_FILE = join(GBRAIN_DIR, 'integrity.log.jsonl');
-const PROGRESS_FILE = join(GBRAIN_DIR, 'integrity-progress.jsonl');
+// Lazy: GBRAIN_HOME may be set after module load.
+const getReviewFile = () => gbrainPath('integrity-review.md');
+const getLogFile = () => gbrainPath('integrity.log.jsonl');
+const getProgressFile = () => gbrainPath('integrity-progress.jsonl');
 
 // ---------------------------------------------------------------------------
 // Bare-tweet detection
@@ -157,9 +157,9 @@ interface ProgressEntry {
 }
 
 function loadProgress(): Set<string> {
-  if (!existsSync(PROGRESS_FILE)) return new Set();
+  if (!existsSync(getProgressFile())) return new Set();
   const seen = new Set<string>();
-  const content = readFileSync(PROGRESS_FILE, 'utf-8');
+  const content = readFileSync(getProgressFile(), 'utf-8');
   for (const line of content.split('\n')) {
     if (!line.trim()) continue;
     try {
@@ -173,12 +173,12 @@ function loadProgress(): Set<string> {
 }
 
 function appendProgress(entry: ProgressEntry): void {
-  ensureDir(PROGRESS_FILE);
-  appendFileSync(PROGRESS_FILE, JSON.stringify(entry) + '\n', 'utf-8');
+  ensureDir(getProgressFile());
+  appendFileSync(getProgressFile(), JSON.stringify(entry) + '\n', 'utf-8');
 }
 
 function clearProgress(): void {
-  if (existsSync(PROGRESS_FILE)) writeFileSync(PROGRESS_FILE, '', 'utf-8');
+  if (existsSync(getProgressFile())) writeFileSync(getProgressFile(), '', 'utf-8');
 }
 
 function ensureDir(path: string): void {
@@ -212,7 +212,7 @@ export async function runIntegrity(args: string[]): Promise<void> {
   }
   if (sub === 'reset-progress') {
     clearProgress();
-    console.log('Cleared progress log:', PROGRESS_FILE);
+    console.log('Cleared progress log:', getProgressFile());
     return;
   }
 
@@ -266,6 +266,12 @@ export interface IntegrityScanOptions {
   limit?: number;
   /** Slug prefix filter (e.g. "people") — matches slugs starting with `${typeFilter}/`. */
   typeFilter?: string;
+  /**
+   * When true (default), batch-load pages via a single SQL query instead of
+   * sequential getPage() calls. Falls back to sequential on error (e.g. PGLite).
+   * Eliminates 500 round-trips through PgBouncer that caused doctor timeouts.
+   */
+  batchLoad?: boolean;
 }
 
 export interface IntegrityScanResult {
@@ -287,17 +293,44 @@ export async function scanIntegrity(
   engine: BrainEngine,
   opts: IntegrityScanOptions = {},
 ): Promise<IntegrityScanResult> {
-  const { limit = Infinity, typeFilter } = opts;
-  const allSlugs = [...(await engine.getAllSlugs())].sort();
+  const { limit = Infinity, typeFilter, batchLoad = true } = opts;
+
+  // Fast path: single SQL query instead of N sequential getPage() calls.
+  // Eliminates ~500 round-trips through PgBouncer that caused doctor to
+  // timeout on transaction-mode pooling. Postgres-only: PGLite has no
+  // postgres.js connection, so the gate keeps the GBRAIN_DEBUG fallback
+  // log clean for real Postgres errors instead of expected PGLite skips.
+  if (batchLoad && limit !== Infinity && engine.kind === 'postgres') {
+    try {
+      return await scanIntegrityBatch(limit, typeFilter);
+    } catch (err) {
+      // GBRAIN_DEBUG=1 surfaces real Postgres errors (deadlock, connection
+      // drop, SQL bug) that would otherwise vanish into the sequential
+      // fallback. Quiet by default since the fallback is harmless.
+      if (process.env.GBRAIN_DEBUG) {
+        console.error(
+          '[integrity] batch path failed, falling back to sequential:',
+          err instanceof Error ? err.message : err,
+        );
+      }
+    }
+  }
+
+  // v0.32.8: listAllPageRefs replaces getAllSlugs+getPage N+1 pattern that
+  // silently defaulted to source_id='default' for non-default-source pages.
+  // Now we enumerate (slug, source_id) pairs and thread sourceId to getPage.
+  const allRefs = (await engine.listAllPageRefs()).sort((a, b) =>
+    a.slug.localeCompare(b.slug) || a.source_id.localeCompare(b.source_id)
+  );
 
   const bareHits: BareTweetHit[] = [];
   const externalHits: ExternalLinkHit[] = [];
   let pagesScanned = 0;
 
-  for (const slug of allSlugs) {
+  for (const { slug, source_id } of allRefs) {
     if (typeFilter && !slug.startsWith(`${typeFilter}/`)) continue;
     if (pagesScanned >= limit) break;
-    const page = await engine.getPage(slug);
+    const page = await engine.getPage(slug, { sourceId: source_id });
     if (!page) continue;
     // Skip grandfathered pages (opted out of brain-integrity enforcement)
     if ((page.frontmatter as Record<string, unknown> | undefined)?.validate === false) continue;
@@ -314,6 +347,54 @@ export async function scanIntegrity(
     .map(([slug, count]) => ({ slug, count }));
 
   return { pagesScanned, bareHits, externalHits, topPages };
+}
+
+/**
+ * Batch-load integrity scan: fetches all candidate pages in a single SQL
+ * query, then scans in-memory. Reduces PgBouncer round-trips from ~500 to 1.
+ */
+async function scanIntegrityBatch(
+  limit: number,
+  typeFilter?: string,
+): Promise<IntegrityScanResult> {
+  const sql = db.getConnection();
+  const typeCondition = typeFilter ? sql`AND slug LIKE ${typeFilter + '/%'}` : sql``;
+  // Boolean validate is the documented contract; stringly-typed 'false' (quoted
+  // YAML) diverges from the sequential path's strict === false check. Intentional
+  // — gbrain lint should reject stringly-typed validate at write time.
+  const validateCondition = sql`AND (frontmatter->>'validate' IS NULL OR frontmatter->>'validate' != 'false')`;
+
+  // v0.32.8: scan ONE row per (source_id, slug) pair, not one per slug.
+  // Pre-fix used DISTINCT ON (slug) which collapsed multi-source rows into
+  // one — that was the bug class. Now batch parity matches the sequential
+  // listAllPageRefs() walk: integrity violations in non-default-source pages
+  // get reported instead of silently shadowed by their default-source twin.
+  const rows = await sql`
+    SELECT slug, compiled_truth, frontmatter
+    FROM pages
+    WHERE 1=1 ${typeCondition} ${validateCondition}
+    ORDER BY source_id, slug
+    LIMIT ${limit}
+  `;
+
+  const bareHits: BareTweetHit[] = [];
+  const externalHits: ExternalLinkHit[] = [];
+
+  for (const row of rows) {
+    const slug = row.slug as string;
+    const compiledTruth = row.compiled_truth as string;
+    bareHits.push(...findBareTweetHits(compiledTruth, slug));
+    externalHits.push(...findExternalLinks(compiledTruth, slug));
+  }
+
+  const byPage = new Map<string, number>();
+  for (const h of bareHits) byPage.set(h.slug, (byPage.get(h.slug) ?? 0) + 1);
+  const topPages = [...byPage.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 10)
+    .map(([slug, count]) => ({ slug, count }));
+
+  return { pagesScanned: rows.length, bareHits, externalHits, topPages };
 }
 
 // ---------------------------------------------------------------------------
@@ -334,7 +415,7 @@ async function cmdAuto(args: string[]): Promise<void> {
     process.exit(1);
   }
 
-  ensureDir(GBRAIN_DIR);
+  ensureDir(gbrainPath());
 
   const engine = await connect();
   const registry = getDefaultRegistry();
@@ -366,14 +447,19 @@ async function cmdAuto(args: string[]): Promise<void> {
   const progress = createProgress(cliOptsToProgressOptions(getCliOptions()));
 
   try {
-    const allSlugs = [...(await engine.getAllSlugs())].sort();
-    const toScan = allSlugs.filter(s => !seen.has(s));
+    // v0.32.8: listAllPageRefs enumerates (slug, source_id) pairs so we
+    // can thread sourceId to getPage. Pre-fix this defaulted to 'default'
+    // and silently skipped non-default-source pages.
+    const allRefs = (await engine.listAllPageRefs()).sort((a, b) =>
+      a.slug.localeCompare(b.slug) || a.source_id.localeCompare(b.source_id)
+    );
+    const toScan = allRefs.filter(r => !seen.has(r.slug));
     progress.start('integrity.auto', toScan.length);
-    for (const slug of allSlugs) {
+    for (const { slug, source_id } of allRefs) {
       if (pagesProcessed >= limit) break;
       if (seen.has(slug)) continue;
 
-      const page = await engine.getPage(slug);
+      const page = await engine.getPage(slug, { sourceId: source_id });
       if (!page) continue;
 
       pagesProcessed++;
@@ -473,9 +559,9 @@ async function cmdAuto(args: string[]): Promise<void> {
     console.log(`Review queue (≥${reviewLower} <${confidenceThreshold}): ${bucketReview}`);
     console.log(`Skipped (<${reviewLower}): ${bucketSkip}`);
     if (bucketErr > 0) console.log(`Resolver errors: ${bucketErr}`);
-    console.log(`\nReview queue: ${REVIEW_FILE}`);
-    console.log(`Skipped log:  ${LOG_FILE}`);
-    console.log(`Progress:     ${PROGRESS_FILE}`);
+    console.log(`\nReview queue: ${getReviewFile()}`);
+    console.log(`Skipped log:  ${getLogFile()}`);
+    console.log(`Progress:     ${getProgressFile()}`);
   } finally {
     await engine.disconnect();
   }
@@ -486,15 +572,15 @@ async function cmdAuto(args: string[]): Promise<void> {
 // ---------------------------------------------------------------------------
 
 function cmdReview(): void {
-  if (!existsSync(REVIEW_FILE)) {
+  if (!existsSync(getReviewFile())) {
     console.log(`No review queue yet. Run: gbrain integrity auto --confidence 0.8`);
     return;
   }
-  const content = readFileSync(REVIEW_FILE, 'utf-8');
+  const content = readFileSync(getReviewFile(), 'utf-8');
   const count = (content.match(/^## /gm) ?? []).length;
-  console.log(`Review queue: ${REVIEW_FILE}`);
+  console.log(`Review queue: ${getReviewFile()}`);
   console.log(`Entries: ${count}`);
-  console.log(`\nOpen with: $EDITOR ${REVIEW_FILE}`);
+  console.log(`\nOpen with: $EDITOR ${getReviewFile()}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -575,7 +661,7 @@ interface ReviewArgs {
 }
 
 function appendReview(args: ReviewArgs): void {
-  ensureDir(REVIEW_FILE);
+  ensureDir(getReviewFile());
   const { slug, hit, result, handle } = args;
   const block = [
     `## ${slug}:${hit.line}  (confidence ${result.confidence.toFixed(2)})`,
@@ -589,12 +675,12 @@ function appendReview(args: ReviewArgs): void {
     '---',
     '',
   ].join('\n');
-  appendFileSync(REVIEW_FILE, block, 'utf-8');
+  appendFileSync(getReviewFile(), block, 'utf-8');
 }
 
 interface SkipArgs { slug: string; hit: BareTweetHit; reason: string }
 function logSkip(args: SkipArgs): void {
-  ensureDir(LOG_FILE);
+  ensureDir(getLogFile());
   const entry = {
     timestamp: new Date().toISOString(),
     slug: args.slug,
@@ -603,7 +689,7 @@ function logSkip(args: SkipArgs): void {
     raw: args.hit.rawLine.slice(0, 200),
     reason: args.reason,
   };
-  appendFileSync(LOG_FILE, JSON.stringify(entry) + '\n', 'utf-8');
+  appendFileSync(getLogFile(), JSON.stringify(entry) + '\n', 'utf-8');
 }
 
 // ---------------------------------------------------------------------------

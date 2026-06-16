@@ -128,6 +128,8 @@ export interface MinionJobInput {
   max_spawn_depth?: number;
   /** Global dedup key. Same key returns the existing job, no second row created. */
   idempotency_key?: string;
+  /** Submission backpressure: cap waiting jobs with this name before inserting a new row. */
+  maxWaiting?: number;
 
   // v12: scheduler polish
   /**
@@ -158,6 +160,35 @@ export interface MinionWorkerOpts {
   stalledInterval?: number; // ms, default 30000
   maxStalledCount?: number; // default 1
   pollInterval?: number; // ms, default 5000 (for PGLite fallback)
+  /** RSS threshold in MB. When exceeded, worker triggers graceful shutdown
+   *  so a supervisor can respawn it. 0 or undefined = disabled. */
+  maxRssMb?: number;
+  /** Optional injection point for RSS readback. Defaults to
+   *  `() => process.memoryUsage().rss`. Tests inject deterministic sequences. */
+  getRss?: () => number;
+  /** Periodic RSS check interval in ms, default 60000. Catches the freeze
+   *  case where all concurrency slots are wedged with zero job completions
+   *  so the per-job check never fires. */
+  rssCheckInterval?: number;
+  /** Self-health-check interval in ms. 0 = disabled. Default: 60000 (1 minute).
+   *  Automatically disabled when running under a supervisor (GBRAIN_SUPERVISED=1).
+   *  Provides DB liveness probes and stall detection for bare `gbrain jobs work`
+   *  deployments managed by external process managers (systemd, Docker, cron). */
+  healthCheckInterval?: number;
+  /** Stall detection: ms of continuous idle (waiting>0, inFlight=0, no completions)
+   *  before emitting the first warning. Default: 300000 (5 minutes). */
+  stallWarnAfterMs?: number;
+  /** Stall detection: ms of continuous idle before emitting `'unhealthy'` with
+   *  reason='stalled'. Default: 600000 (10 minutes). Must be > stallWarnAfterMs. */
+  stallExitAfterMs?: number;
+  /** DB liveness probe: number of consecutive failed `SELECT 1` probes before
+   *  emitting `'unhealthy'` with reason='db_dead'. Default: 3. */
+  dbFailExitAfter?: number;
+  /** Per-probe wall-clock timeout in ms. A `SELECT 1` that hangs longer than
+   *  this counts as a failure (fed into dbFailExitAfter). Without this, a
+   *  hung probe would wedge the recursive setTimeout chain forever and
+   *  silently disable the health monitor. Default: 10000 (10 seconds). */
+  dbProbeTimeoutMs?: number;
 }
 
 // --- Job Context (passed to handlers) ---
@@ -390,6 +421,66 @@ export interface SubagentHandlerData {
   system?: string;
   /** Template variables for subagent_def. Arbitrary JSON-serializable. */
   input_vars?: Record<string, unknown>;
+  /**
+   * Connected-gbrains brain id (v0.19+, PR 0 plumbing only).
+   *
+   * CURRENT BEHAVIOR: stamped onto every tool-call's `OperationContext.
+   * brainId` but NOT yet used to select an engine at dispatch time.
+   * `gbrain agent run` does not yet accept a `--brain` flag that would
+   * populate this field — all subagent jobs submitted by the CLI today
+   * default to the host engine. The field + handler acceptance exist so
+   * PR 1 can add the registry lookup + CLI flag in a single commit.
+   *
+   * FUTURE (PR 1): setting `brain_id: "yc-media"` at job submission will
+   * cause every tool call from the subagent to run against the yc-media
+   * engine via BrainRegistry.getBrain() at buildOpContext time.
+   */
+  brain_id?: string;
+  /**
+   * Trusted-workspace allow-list for put_page (v0.23 dream cycle).
+   *
+   * When set, the subagent's put_page calls are bounded to slugs matching
+   * any of these prefix globs (e.g. ["wiki/personal/reflections/*",
+   * "wiki/originals/*"]). When unset/empty, the legacy
+   * `wiki/agents/<subagentId>/...` namespace check applies.
+   *
+   * Trust comes from PROTECTED_JOB_NAMES gating subagent submission — MCP
+   * cannot reach this field. Only cycle.ts (synthesize/patterns phases)
+   * and direct CLI submitters set it.
+   */
+  allowed_slug_prefixes?: string[];
+  /**
+   * v0.41 Approach C: opt out of the auto-generated tool-usage preamble
+   * that `buildSystemPrompt()` splices into `system`. Default behavior
+   * (omitted or false) prepends a deterministic preamble listing each
+   * tool's name + usage_hint. Set to `true` to keep `system` byte-for-byte
+   * as provided.
+   *
+   * Use when the caller has hand-tuned a complete system prompt for a
+   * specific subagent (no benefit from auto-generated guidance, prompt
+   * cache hits ride entirely on the caller-supplied prefix).
+   */
+  system_no_tool_preamble?: boolean;
+  /**
+   * v0.41 E6 — opt OUT of classifier-gated auto-resubmit on terminal
+   * failures. Default behavior (omitted or false) runs the
+   * `RECOVERABLE_CLUSTERS` self-fix path when the failure classifies as
+   * one of {`prompt_too_long`, `tool_schema_mismatch`, `malformed_json`}.
+   * Set true to disable per-job (useful for graders / probes where a
+   * retry would muddy the signal).
+   */
+  no_self_fix?: boolean;
+  /**
+   * v0.41 E6 — internal marker set by `submitSelfFixChild` so the
+   * chain-depth walker can count self-fix ancestors. Counter starts at
+   * 0 on a fresh user-submitted job; increments by 1 per chain hop.
+   */
+  is_self_fix_child?: boolean;
+  /**
+   * v0.41 E6 — which classifier bucket triggered this self-fix child.
+   * Read by audit + diagnostic surfaces (jobs get / dashboard).
+   */
+  self_fix_cluster?: string;
 }
 
 /**
@@ -440,6 +531,20 @@ export interface ToolDef {
   input_schema: Record<string, unknown>;
   idempotent: boolean;
   execute(input: unknown, ctx: ToolCtx): Promise<unknown>;
+  /**
+   * v0.41 Approach C: one-line hint surfaced verbatim in the subagent
+   * system prompt's tool preamble. Tells the model WHEN to use this tool.
+   * The `description` tells the model HOW; the `usage_hint` tells WHEN.
+   *
+   * Field-report case: a `shell` tool sat in the registry and the subagent
+   * never used it because nothing told the model "to write a file, use
+   * shell." Per-tool hints surface that directly. Plugin authors get this
+   * affordance for free.
+   *
+   * Optional — omitted tools just don't get a hint line. Must be a single
+   * line (no embedded newlines) so the rendered preamble stays scannable.
+   */
+  usage_hint?: string;
 }
 
 /**

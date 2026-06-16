@@ -40,10 +40,20 @@ describeE2E('v0.18.0 multi-source — Postgres schema shape (fresh install)', ()
     // block hermetic. file_migration_ledger cascades from files which
     // setupDB already truncates, but wipe explicitly in case files did
     // not cascade it.
+    // Also reset the default source's name + config to the canonical
+    // seed shape — storage-tiering.test.ts writes name='Default' (capital
+    // D) when it runs first against the same Postgres DB and leaves no
+    // cleanup behind, leaking that capitalization into our schema-shape
+    // assertions. Reset here so we are order-independent.
     const conn = getConn();
     await conn.unsafe(`DELETE FROM sources WHERE id != 'default'`);
     await conn.unsafe(`DELETE FROM file_migration_ledger`);
-  });
+    await conn.unsafe(
+      `UPDATE sources SET name = 'default', local_path = NULL,
+         last_commit = NULL, config = '{"federated": true}'::jsonb
+       WHERE id = 'default'`,
+    );
+  }, 30_000);
   afterAll(async () => {
     await teardownDB();
   });
@@ -134,10 +144,20 @@ describeE2E('v0.18.0 multi-source — composite UNIQUE semantics on real Postgre
     // block hermetic. file_migration_ledger cascades from files which
     // setupDB already truncates, but wipe explicitly in case files did
     // not cascade it.
+    // Also reset the default source's name + config to the canonical
+    // seed shape — storage-tiering.test.ts writes name='Default' (capital
+    // D) when it runs first against the same Postgres DB and leaves no
+    // cleanup behind, leaking that capitalization into our schema-shape
+    // assertions. Reset here so we are order-independent.
     const conn = getConn();
     await conn.unsafe(`DELETE FROM sources WHERE id != 'default'`);
     await conn.unsafe(`DELETE FROM file_migration_ledger`);
-  });
+    await conn.unsafe(
+      `UPDATE sources SET name = 'default', local_path = NULL,
+         last_commit = NULL, config = '{"federated": true}'::jsonb
+       WHERE id = 'default'`,
+    );
+  }, 30_000);
   afterAll(async () => {
     await teardownDB();
   });
@@ -202,10 +222,20 @@ describeE2E('v0.18.0 multi-source — cascade delete covers every dependent row'
     // block hermetic. file_migration_ledger cascades from files which
     // setupDB already truncates, but wipe explicitly in case files did
     // not cascade it.
+    // Also reset the default source's name + config to the canonical
+    // seed shape — storage-tiering.test.ts writes name='Default' (capital
+    // D) when it runs first against the same Postgres DB and leaves no
+    // cleanup behind, leaking that capitalization into our schema-shape
+    // assertions. Reset here so we are order-independent.
     const conn = getConn();
     await conn.unsafe(`DELETE FROM sources WHERE id != 'default'`);
     await conn.unsafe(`DELETE FROM file_migration_ledger`);
-  });
+    await conn.unsafe(
+      `UPDATE sources SET name = 'default', local_path = NULL,
+         last_commit = NULL, config = '{"federated": true}'::jsonb
+       WHERE id = 'default'`,
+    );
+  }, 30_000);
   afterAll(async () => {
     await teardownDB();
   });
@@ -271,7 +301,8 @@ describeE2E('v0.18.0 multi-source — cascade delete covers every dependent row'
     expect((await conn.unsafe(`SELECT COUNT(*)::int AS n FROM files WHERE source_id = 'cascadetest'`))[0].n).toBe(1);
 
     // Remove the source.
-    await runSources(engine as unknown as Parameters<typeof runSources>[0], ['remove', 'cascadetest', '--yes']);
+    // v0.26.5: populated sources require --confirm-destructive; --yes alone is rejected.
+    await runSources(engine as unknown as Parameters<typeof runSources>[0], ['remove', 'cascadetest', '--confirm-destructive']);
 
     // Everything for that source is gone.
     expect((await conn.unsafe(`SELECT COUNT(*)::int AS n FROM pages WHERE source_id = 'cascadetest'`))[0].n).toBe(0);
@@ -295,10 +326,20 @@ describeE2E('v0.18.0 multi-source — sync --source routes through sources table
     // block hermetic. file_migration_ledger cascades from files which
     // setupDB already truncates, but wipe explicitly in case files did
     // not cascade it.
+    // Also reset the default source's name + config to the canonical
+    // seed shape — storage-tiering.test.ts writes name='Default' (capital
+    // D) when it runs first against the same Postgres DB and leaves no
+    // cleanup behind, leaking that capitalization into our schema-shape
+    // assertions. Reset here so we are order-independent.
     const conn = getConn();
     await conn.unsafe(`DELETE FROM sources WHERE id != 'default'`);
     await conn.unsafe(`DELETE FROM file_migration_ledger`);
-  });
+    await conn.unsafe(
+      `UPDATE sources SET name = 'default', local_path = NULL,
+         last_commit = NULL, config = '{"federated": true}'::jsonb
+       WHERE id = 'default'`,
+    );
+  }, 30_000);
   afterAll(async () => {
     await teardownDB();
   });
@@ -359,10 +400,20 @@ describeE2E('v0.18.0 multi-source — sources table surface', () => {
     // block hermetic. file_migration_ledger cascades from files which
     // setupDB already truncates, but wipe explicitly in case files did
     // not cascade it.
+    // Also reset the default source's name + config to the canonical
+    // seed shape — storage-tiering.test.ts writes name='Default' (capital
+    // D) when it runs first against the same Postgres DB and leaves no
+    // cleanup behind, leaking that capitalization into our schema-shape
+    // assertions. Reset here so we are order-independent.
     const conn = getConn();
     await conn.unsafe(`DELETE FROM sources WHERE id != 'default'`);
     await conn.unsafe(`DELETE FROM file_migration_ledger`);
-  });
+    await conn.unsafe(
+      `UPDATE sources SET name = 'default', local_path = NULL,
+         last_commit = NULL, config = '{"federated": true}'::jsonb
+       WHERE id = 'default'`,
+    );
+  }, 30_000);
   afterAll(async () => {
     await teardownDB();
   });
@@ -422,10 +473,20 @@ describeE2E('v0.18.0 multi-source — storage backfill against file_migration_le
     // block hermetic. file_migration_ledger cascades from files which
     // setupDB already truncates, but wipe explicitly in case files did
     // not cascade it.
+    // Also reset the default source's name + config to the canonical
+    // seed shape — storage-tiering.test.ts writes name='Default' (capital
+    // D) when it runs first against the same Postgres DB and leaves no
+    // cleanup behind, leaking that capitalization into our schema-shape
+    // assertions. Reset here so we are order-independent.
     const conn = getConn();
     await conn.unsafe(`DELETE FROM sources WHERE id != 'default'`);
     await conn.unsafe(`DELETE FROM file_migration_ledger`);
-  });
+    await conn.unsafe(
+      `UPDATE sources SET name = 'default', local_path = NULL,
+         last_commit = NULL, config = '{"federated": true}'::jsonb
+       WHERE id = 'default'`,
+    );
+  }, 30_000);
   afterAll(async () => {
     await teardownDB();
   });
@@ -508,7 +569,7 @@ describeE2E('v0.18.0 multi-source — addLinksBatch / addTimelineEntriesBatch so
     const conn = getConn();
     await conn.unsafe(`DELETE FROM sources WHERE id != 'default'`);
     await conn.unsafe(`DELETE FROM file_migration_ledger`);
-  });
+  }, 30_000);
   afterAll(async () => { await teardownDB(); });
 
   async function seedSameSlugTwoSources() {

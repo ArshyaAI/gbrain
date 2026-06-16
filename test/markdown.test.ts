@@ -87,6 +87,26 @@ Content
     const parsed = parseMarkdown(md, 'concepts/do-things-that-dont-scale.md');
     expect(parsed.slug).toBe('concepts/do-things-that-dont-scale');
   });
+
+  // v0.20: BrainBench / native inbox-chat-calendar Page types. These 5 directory
+  // heuristics exercise PageType 'email | slack | calendar-event | note | meeting'
+  // which were added for amara-life-v1 ingest but are useful for any gbrain user
+  // ingesting an inbox dump, Slack export, iCal, meeting transcript, or daily notes.
+  test.each([
+    ['emails/em-0001.md', 'email'],
+    ['email/em-0001.md', 'email'],
+    ['slack/sl-0037.md', 'slack'],
+    ['cal/evt-0042.md', 'calendar-event'],
+    ['calendar/evt-0042.md', 'calendar-event'],
+    ['notes/2026-04-standup.md', 'note'],
+    ['note/2026-04-standup.md', 'note'],
+    ['meetings/mtg-0003.md', 'meeting'],
+    ['meeting/mtg-0003.md', 'meeting'],
+  ] as const)('infers type %s -> %s', (path, expectedType) => {
+    const md = `---\ntitle: Fixture\n---\nBody\n`;
+    const parsed = parseMarkdown(md, path);
+    expect(parsed.type).toBe(expectedType);
+  });
 });
 
 describe('splitBody', () => {
@@ -280,5 +300,46 @@ Some content.`;
   test('infers writing type from /writing/ paths', () => {
     expect(parseMarkdown('', 'writing/post.md').type).toBe('writing');
     expect(parseMarkdown('', 'projects/blog/writing/essay.md').type).toBe('writing');
+  });
+});
+
+// issue #1939 — js-yaml parses `title: 2024-06-01` as a Date and `title: 1458`
+// as a number. The old `(frontmatter.title as string)` cast was a compile-time
+// lie; at runtime downstream `.toLowerCase()` threw and wedged sync. Coercion
+// must be non-throwing AND deterministic (UTC ISO for dates, no timezone drift).
+describe('issue #1939 — non-string frontmatter coercion', () => {
+  test('date title coerces to its UTC ISO date string', () => {
+    const parsed = parseMarkdown('---\ntitle: 2024-06-01\n---\nbody\n', 'apple-notes/x.md');
+    expect(parsed.title).toBe('2024-06-01');
+    expect(typeof parsed.title).toBe('string');
+  });
+
+  test('number title coerces to its string form', () => {
+    const parsed = parseMarkdown('---\ntitle: 1458\n---\nbody\n', 'apple-notes/x.md');
+    expect(parsed.title).toBe('1458');
+  });
+
+  test('date title is timezone-independent (UTC) — repro file shape', () => {
+    // sources/apple-notes/YC/Talks YC/2023-04-25 1458.md style page.
+    const parsed = parseMarkdown('---\ntitle: 2023-04-25\n---\nnotes\n', 'apple-notes/2023-04-25 1458.md');
+    expect(parsed.title).toBe('2023-04-25'); // never "Mon Apr 24 2023 ...GMT-0700"
+  });
+
+  test('date/number slug + type coerce without throwing', () => {
+    const parsed = parseMarkdown('---\nslug: 2024-06-01\ntype: 2024\n---\nbody\n', 'x.md');
+    expect(typeof parsed.slug).toBe('string');
+    expect(parsed.slug).toBe('2024-06-01');
+    expect(typeof parsed.type).toBe('string');
+  });
+
+  test('missing/empty title falls back to inferred title (no throw)', () => {
+    const parsed = parseMarkdown('---\ntype: note\n---\nbody\n', 'people/alice-example.md');
+    expect(typeof parsed.title).toBe('string');
+    expect(parsed.title.length).toBeGreaterThan(0);
+  });
+
+  test('string title still passes through unchanged', () => {
+    const parsed = parseMarkdown('---\ntitle: A Normal Title\n---\nbody\n', 'x.md');
+    expect(parsed.title).toBe('A Normal Title');
   });
 });
