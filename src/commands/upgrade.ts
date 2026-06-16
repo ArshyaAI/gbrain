@@ -1,15 +1,28 @@
-import { execSync, execFileSync } from 'child_process';
-import { existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync, realpathSync } from 'fs';
-import { join, dirname, resolve } from 'path';
-import { VERSION } from '../version.ts';
+import { execSync, execFileSync } from "child_process";
+import {
+  existsSync,
+  readFileSync,
+  writeFileSync,
+  mkdirSync,
+  appendFileSync,
+  realpathSync,
+} from "fs";
+import { basename, join, dirname, resolve } from "path";
+import { VERSION } from "../version.ts";
 
-const GBRAIN_GITHUB_REPO = 'garrytan/gbrain';
+const GBRAIN_GITHUB_REPO = "garrytan/gbrain";
 
 export async function runUpgrade(args: string[]) {
-  if (args.includes('--help') || args.includes('-h')) {
-    console.log('Usage: gbrain upgrade\n\nSelf-update the CLI.\n\nDetects install method (bun, binary, clawhub) and runs the appropriate update.\nAfter upgrading, shows what\'s new and offers to set up new features.');
+  if (args.includes("--help") || args.includes("-h")) {
+    console.log(
+      "Usage: gbrain upgrade [--swap-only]\n\nSelf-update the CLI.\n\nDetects install method (bun, binary, clawhub) and runs the appropriate update.\nAfter upgrading, shows what's new and offers to set up new features.\n\n--swap-only  Perform ONLY the binary/source swap and skip post-upgrade\n             (migrations run on the next launch). Used by the autopilot\n             silent self-upgrade channel so the daemon can swap + relaunch\n             without a 30-min blocking post-upgrade inside its tick.",
+    );
     return;
   }
+
+  // --swap-only: do the swap, skip the (potentially 30-min) post-upgrade. The
+  // relaunched binary runs migrations on boot (split-brain guard). v0.42.
+  const swapOnly = args.includes("--swap-only");
 
   // Capture old version BEFORE upgrading (Codex finding: old binary runs this code)
   const oldVersion = VERSION;
@@ -19,10 +32,10 @@ export async function runUpgrade(args: string[]) {
 
   let upgraded = false;
   switch (method) {
-    case 'bun-link': {
+    case "bun-link": {
       const linkInfo = detectBunLink();
       if (!linkInfo) {
-        console.error('bun-link detected but could not resolve repo root.');
+        console.error("bun-link detected but could not resolve repo root.");
         break;
       }
       console.log(`Upgrading bun-link source clone at ${linkInfo.repoRoot}...`);
@@ -32,50 +45,116 @@ export async function runUpgrade(args: string[]) {
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
         console.error(`Auto-upgrade failed: ${msg}`);
-        console.error('Auto-upgrade failed. Try manually:');
-        console.error(`  cd ${linkInfo.repoRoot} && git fetch --all --tags --prune && git merge <default-remote>/HEAD && bun install`);
+        console.error("Auto-upgrade failed. Try manually:");
+        console.error(
+          `  cd ${linkInfo.repoRoot} && git fetch --all --tags --prune && git merge <default-remote>/HEAD && bun install`,
+        );
       }
       break;
     }
 
-    case 'bun':
-      console.log('Upgrading via bun...');
+    case "bun": {
+      console.log("Upgrading via bun...");
+      const bunGlobalRoot = resolveBunGlobalRoot();
       try {
-        execSync('bun update gbrain', { stdio: 'inherit', timeout: 120_000 });
+        execFileSync("bun", ["update", "gbrain"], {
+          cwd: bunGlobalRoot,
+          stdio: "inherit",
+          timeout: 120_000,
+        });
         upgraded = true;
       } catch {
-        console.error('Upgrade failed. Try running manually: bun update gbrain');
+        console.error("Upgrade failed. Try running manually:");
+        console.error(`  cd ${bunGlobalRoot} && bun update gbrain`);
       }
       break;
+    }
 
-    case 'binary':
-      console.log('Binary self-update not yet implemented.');
-      console.log('Download the latest binary from GitHub Releases:');
-      console.log('  https://github.com/garrytan/gbrain/releases');
+    case "binary": {
+      // v0.42: real atomic self-update on the published targets
+      // (darwin-arm64, linux-x64). Other platforms have no asset → notify.
+      const { runBinarySelfUpdate } =
+        await import("../core/binary-self-update.ts");
+      console.log("Updating gbrain binary (atomic download + replace)...");
+      const result = await runBinarySelfUpdate();
+      if (result.ok) {
+        upgraded = true;
+      } else if (
+        result.reason === "unsupported_platform" ||
+        result.reason === "no_asset"
+      ) {
+        console.log("No published binary for this platform/arch.");
+        console.log("Download the latest binary from GitHub Releases:");
+        console.log("  https://github.com/garrytan/gbrain/releases");
+      } else {
+        console.error(
+          `Binary self-update failed (${result.reason}${result.error ? `: ${result.error}` : ""}).`,
+        );
+        console.error(
+          "Your existing binary is unchanged. Download manually if needed:",
+        );
+        console.error("  https://github.com/garrytan/gbrain/releases");
+        recordUpgradeError({
+          phase: "binary-self-update",
+          fromVersion: oldVersion,
+          toVersion: "",
+          error: `${result.reason}${result.error ? `: ${result.error}` : ""}`,
+          hint: "Download from https://github.com/garrytan/gbrain/releases",
+        });
+      }
       break;
+    }
 
-    case 'clawhub':
-      console.log('Upgrading via ClawHub...');
+    case "clawhub":
+      console.log("Upgrading via ClawHub...");
       try {
-        execSync('clawhub update gbrain', { stdio: 'inherit', timeout: 120_000 });
+        execSync("clawhub update gbrain", {
+          stdio: "inherit",
+          timeout: 120_000,
+        });
         upgraded = true;
       } catch {
-        console.error('ClawHub upgrade failed. Try: clawhub update gbrain');
+        console.error("ClawHub upgrade failed. Try: clawhub update gbrain");
       }
       break;
 
     default:
-      console.error('Could not detect installation method.');
-      console.log('Try one of:');
-      console.log('  bun update gbrain');
-      console.log('  clawhub update gbrain');
-      console.log('  Download from https://github.com/garrytan/gbrain/releases');
+      console.error("Could not detect installation method.");
+      console.log("Try one of:");
+      console.log("  bun update gbrain");
+      console.log("  clawhub update gbrain");
+      console.log(
+        "  Download from https://github.com/garrytan/gbrain/releases",
+      );
   }
 
   if (upgraded) {
     const newVersion = verifyUpgrade();
     // Save old version for post-upgrade migration detection
     saveUpgradeState(oldVersion, newVersion);
+
+    // Self-upgrade breadcrumb + cache reset (covers both the full and
+    // --swap-only paths, so the autopilot silent channel benefits too):
+    //   - write just-upgraded-from so the next invocation's startup hook prints
+    //     the one-time JUST_UPGRADED confirmation;
+    //   - clear the update-check cache + snooze so a now-stale "upgrade
+    //     available" marker doesn't keep nudging after we've already applied it.
+    try {
+      const su = await import("../core/self-upgrade.ts");
+      su.writeJustUpgraded(oldVersion);
+      su.clearUpdateCache();
+      su.clearSnooze();
+    } catch {
+      /* best-effort: never block the upgrade on confirmation bookkeeping */
+    }
+
+    // --swap-only stops here: the swap is done + smoke-verified, but the
+    // (potentially 30-min) post-upgrade is deferred to the next launch so the
+    // autopilot silent channel can swap + relaunch without freezing its tick.
+    // connectEngine's pending-migration probe + runPostUpgrade run on boot.
+    if (swapOnly) {
+      return;
+    }
     // Run post-upgrade feature discovery (reads migration files from the NEW binary).
     // Timeout bumped 300s → 1800s (30 min) in v0.15.2 because v0.12.0 graph
     // backfill on 50K+ brains regularly exceeded the old ceiling. The heartbeat
@@ -86,23 +165,26 @@ export async function runUpgrade(args: string[]) {
       process.env.GBRAIN_POST_UPGRADE_TIMEOUT_MS || 1_800_000,
     );
     try {
-      execSync('gbrain post-upgrade', { stdio: 'inherit', timeout: postUpgradeTimeoutMs });
+      execSync("gbrain post-upgrade", {
+        stdio: "inherit",
+        timeout: postUpgradeTimeoutMs,
+      });
     } catch (e) {
       // post-upgrade is best-effort, don't fail the upgrade. BUT leave a
       // trail so `gbrain doctor` can surface it and give the user a clear
       // paste-ready recovery command. Silent failure here is how users end
       // up with half-upgraded brains and no signal.
       recordUpgradeError({
-        phase: 'post-upgrade',
+        phase: "post-upgrade",
         fromVersion: oldVersion,
         toVersion: newVersion,
         error: e instanceof Error ? e.message : String(e),
-        hint: 'Run: gbrain apply-migrations --yes',
+        hint: "Run: gbrain apply-migrations --yes",
       });
     }
     // Run features scan to show what's new and what to fix
     try {
-      execSync('gbrain features', { stdio: 'inherit', timeout: 30_000 });
+      execSync("gbrain features", { stdio: "inherit", timeout: 30_000 });
     } catch {
       // features scan is best-effort
     }
@@ -113,75 +195,110 @@ export function upgradeBunLinkSourceClone(repoRoot: string): void {
   ensureCleanWorktree(repoRoot);
 
   const upstream = resolveUpstreamRef(repoRoot);
-  execFileSync('git', ['-C', repoRoot, 'fetch', upstream.remote, '--tags', '--prune'], {
-    stdio: 'inherit',
-    timeout: 120_000,
-  });
+  execFileSync(
+    "git",
+    ["-C", repoRoot, "fetch", upstream.remote, "--tags", "--prune"],
+    {
+      stdio: "inherit",
+      timeout: 120_000,
+    },
+  );
 
   const upstreamRef = upstream.ref;
-  if (isAncestor(repoRoot, upstreamRef, 'HEAD')) {
+  if (isAncestor(repoRoot, upstreamRef, "HEAD")) {
     console.log(`Source clone already includes ${upstreamRef}.`);
-  } else if (isAncestor(repoRoot, 'HEAD', upstreamRef)) {
-    execFileSync('git', ['-C', repoRoot, 'merge', '--ff-only', upstreamRef], {
-      stdio: 'inherit',
+  } else if (isAncestor(repoRoot, "HEAD", upstreamRef)) {
+    execFileSync("git", ["-C", repoRoot, "merge", "--ff-only", upstreamRef], {
+      stdio: "inherit",
       timeout: 120_000,
     });
   } else {
     assertMergeClean(repoRoot, upstreamRef);
-    execFileSync('git', ['-C', repoRoot, 'merge', '--no-edit', upstreamRef], {
-      stdio: 'inherit',
+    execFileSync("git", ["-C", repoRoot, "merge", "--no-edit", upstreamRef], {
+      stdio: "inherit",
       timeout: 120_000,
     });
   }
 
-  execFileSync('bun', ['install'], { cwd: repoRoot, stdio: 'inherit', timeout: 120_000 });
+  execFileSync("bun", ["install"], {
+    cwd: repoRoot,
+    stdio: "inherit",
+    timeout: 120_000,
+  });
 }
 
 function ensureCleanWorktree(repoRoot: string): void {
-  const status = execFileSync('git', ['-C', repoRoot, 'status', '--porcelain'], {
-    encoding: 'utf-8',
-    timeout: 10_000,
-  }).trim();
+  const status = execFileSync(
+    "git",
+    ["-C", repoRoot, "status", "--porcelain"],
+    {
+      encoding: "utf-8",
+      timeout: 10_000,
+    },
+  ).trim();
   if (status) {
-    throw new Error('source clone has uncommitted changes; commit/stash them before upgrading');
+    throw new Error(
+      "source clone has uncommitted changes; commit/stash them before upgrading",
+    );
   }
 }
 
 function resolveUpstreamRef(repoRoot: string): { remote: string; ref: string } {
-  const tracked = gitOutput(repoRoot, ['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}']);
+  const tracked = gitOutput(repoRoot, [
+    "rev-parse",
+    "--abbrev-ref",
+    "--symbolic-full-name",
+    "@{u}",
+  ]);
   if (tracked) {
-    return { remote: tracked.split('/')[0] || 'origin', ref: tracked };
+    return { remote: tracked.split("/")[0] || "origin", ref: tracked };
   }
 
   // Source-linked agent installs often run on custom integration branches with
   // no tracking branch. Use the repository's default upstream branch instead
   // of raw `git pull`, which fails with "no tracking information".
-  const remote = resolveDefaultRemote(repoRoot) || 'origin';
-  const remoteHead = gitOutput(repoRoot, ['rev-parse', '--abbrev-ref', `${remote}/HEAD`]);
+  const remote = resolveDefaultRemote(repoRoot) || "origin";
+  const remoteHead = gitOutput(repoRoot, [
+    "rev-parse",
+    "--abbrev-ref",
+    `${remote}/HEAD`,
+  ]);
   return {
     remote,
-    ref: remoteHead && !remoteHead.endsWith('/HEAD') ? remoteHead : `${remote}/master`,
+    ref:
+      remoteHead && !remoteHead.endsWith("/HEAD")
+        ? remoteHead
+        : `${remote}/master`,
   };
 }
 
 function assertMergeClean(repoRoot: string, upstreamRef: string): void {
   try {
-    execFileSync('git', ['-C', repoRoot, 'merge-tree', '--write-tree', 'HEAD', upstreamRef], {
-      stdio: 'pipe',
-      timeout: 60_000,
-    });
+    execFileSync(
+      "git",
+      ["-C", repoRoot, "merge-tree", "--write-tree", "HEAD", upstreamRef],
+      {
+        stdio: "pipe",
+        timeout: 60_000,
+      },
+    );
   } catch {
-    throw new Error(`local branch and ${upstreamRef} diverged with conflicts; resolve a manual merge first`);
+    throw new Error(
+      `local branch and ${upstreamRef} diverged with conflicts; resolve a manual merge first`,
+    );
   }
 }
 
 function resolveDefaultRemote(repoRoot: string): string | null {
-  const remotes = gitOutput(repoRoot, ['remote']);
+  const remotes = gitOutput(repoRoot, ["remote"]);
   if (!remotes) return null;
 
-  const names = remotes.split('\n').map(remote => remote.trim()).filter(Boolean);
+  const names = remotes
+    .split("\n")
+    .map((remote) => remote.trim())
+    .filter(Boolean);
   for (const remote of names) {
-    const url = gitOutput(repoRoot, ['remote', 'get-url', remote]);
+    const url = gitOutput(repoRoot, ["remote", "get-url", remote]);
     if (url?.toLowerCase().includes(GBRAIN_GITHUB_REPO)) {
       return remote;
     }
@@ -190,12 +307,27 @@ function resolveDefaultRemote(repoRoot: string): string | null {
   return names[0] || null;
 }
 
-function isAncestor(repoRoot: string, maybeAncestor: string, descendant: string): boolean {
+function isAncestor(
+  repoRoot: string,
+  maybeAncestor: string,
+  descendant: string,
+): boolean {
   try {
-    execFileSync('git', ['-C', repoRoot, 'merge-base', '--is-ancestor', maybeAncestor, descendant], {
-      stdio: 'pipe',
-      timeout: 10_000,
-    });
+    execFileSync(
+      "git",
+      [
+        "-C",
+        repoRoot,
+        "merge-base",
+        "--is-ancestor",
+        maybeAncestor,
+        descendant,
+      ],
+      {
+        stdio: "pipe",
+        timeout: 10_000,
+      },
+    );
     return true;
   } catch {
     return false;
@@ -204,11 +336,59 @@ function isAncestor(repoRoot: string, maybeAncestor: string, descendant: string)
 
 function gitOutput(repoRoot: string, args: string[]): string | null {
   try {
-    return execFileSync('git', ['-C', repoRoot, ...args], {
-      encoding: 'utf-8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-      timeout: 10_000,
-    }).trim() || null;
+    return (
+      execFileSync("git", ["-C", repoRoot, ...args], {
+        encoding: "utf-8",
+        stdio: ["ignore", "pipe", "ignore"],
+        timeout: 10_000,
+      }).trim() || null
+    );
+  } catch {
+    return null;
+  }
+}
+
+export function resolveBunGlobalRoot(): string {
+  const bunInstall = process.env.BUN_INSTALL;
+  if (bunInstall) {
+    return join(bunInstall, "install", "global");
+  }
+
+  const defaultRoot = join(process.env.HOME || "", ".bun", "install", "global");
+  if (isBunGlobalRoot(defaultRoot)) {
+    return defaultRoot;
+  }
+
+  const installRoot = findBunInstallRootFromArgv();
+  return installRoot ?? defaultRoot;
+}
+
+function isBunGlobalRoot(dir: string): boolean {
+  return (
+    existsSync(join(dir, "package.json")) &&
+    existsSync(join(dir, "node_modules"))
+  );
+}
+
+function findBunInstallRootFromArgv(): string | null {
+  try {
+    const argv1 = process.argv[1];
+    if (!argv1) return null;
+
+    let dir = dirname(realpathSync(argv1));
+    for (let i = 0; i < 10; i++) {
+      if (
+        basename(dir) === "gbrain" &&
+        basename(dirname(dir)) === "node_modules"
+      ) {
+        const root = dirname(dirname(dir));
+        if (isBunGlobalRoot(root)) return root;
+      }
+      const parent = dirname(dir);
+      if (parent === dir) break;
+      dir = parent;
+    }
+    return null;
   } catch {
     return null;
   }
@@ -216,12 +396,15 @@ function gitOutput(repoRoot: string, args: string[]): string | null {
 
 function verifyUpgrade(): string {
   try {
-    const output = execSync('gbrain --version', { encoding: 'utf-8', timeout: 10_000 }).trim();
+    const output = execSync("gbrain --version", {
+      encoding: "utf-8",
+      timeout: 10_000,
+    }).trim();
     console.log(`Upgrade complete. Now running: ${output}`);
-    return output.replace(/^gbrain\s*/i, '').trim();
+    return output.replace(/^gbrain\s*/i, "").trim();
   } catch {
-    console.log('Upgrade complete. Could not verify new version.');
-    return '';
+    console.log("Upgrade complete. Could not verify new version.");
+    return "";
   }
 }
 
@@ -240,17 +423,18 @@ export function recordUpgradeError(record: {
   hint: string;
 }): void {
   try {
-    const dir = join(process.env.HOME || '', '.gbrain');
+    const dir = join(process.env.HOME || "", ".gbrain");
     mkdirSync(dir, { recursive: true });
-    const path = join(dir, 'upgrade-errors.jsonl');
-    const line = JSON.stringify({
-      ts: new Date().toISOString(),
-      phase: record.phase,
-      from_version: record.fromVersion,
-      to_version: record.toVersion,
-      error: record.error,
-      hint: record.hint,
-    }) + '\n';
+    const path = join(dir, "upgrade-errors.jsonl");
+    const line =
+      JSON.stringify({
+        ts: new Date().toISOString(),
+        phase: record.phase,
+        from_version: record.fromVersion,
+        to_version: record.toVersion,
+        error: record.error,
+        hint: record.hint,
+      }) + "\n";
     appendFileSync(path, line);
   } catch {
     // Recording errors is itself best-effort. The user will still see the
@@ -260,11 +444,11 @@ export function recordUpgradeError(record: {
 
 function saveUpgradeState(oldVersion: string, newVersion: string) {
   try {
-    const dir = join(process.env.HOME || '', '.gbrain');
+    const dir = join(process.env.HOME || "", ".gbrain");
     mkdirSync(dir, { recursive: true });
-    const statePath = join(dir, 'upgrade-state.json');
+    const statePath = join(dir, "upgrade-state.json");
     const state: Record<string, unknown> = existsSync(statePath)
-      ? JSON.parse(readFileSync(statePath, 'utf-8'))
+      ? JSON.parse(readFileSync(statePath, "utf-8"))
       : {};
     state.last_upgrade = {
       from: oldVersion,
@@ -297,30 +481,121 @@ function saveUpgradeState(oldVersion: string, newVersion: string) {
  * skills/migrations/*.md, so compiled binaries see the same set source
  * installs do.
  */
+/**
+ * v0.42 self-upgrade setup (file plane; idempotent). Default existing installs
+ * to `notify` (a nudge, not autonomy — `auto` stays an explicit opt-in), show a
+ * one-time informational banner, and rewrite an existing autopilot systemd unit
+ * to Restart=always so the silent channel's exit-for-relaunch respawns.
+ */
+async function applySelfUpgradeSetup(): Promise<void> {
+  try {
+    const { loadConfig, saveConfig } = await import("../core/config.ts");
+    const cfg = loadConfig();
+    if (cfg) {
+      const su = cfg.self_upgrade ?? {};
+      let changed = false;
+      if (su.mode === undefined) {
+        su.mode = "notify";
+        changed = true;
+      }
+      if (!su.mode_prompted) {
+        console.log("");
+        console.log(
+          "═══════════════════════════════════════════════════════════════",
+        );
+        console.log("[gbrain] Self-upgrade is ON in NOTIFY mode.");
+        console.log(
+          "[gbrain] Every gbrain invocation now checks for new versions and",
+        );
+        console.log(
+          "[gbrain] nudges when one is available. Apply with: gbrain self-upgrade",
+        );
+        console.log("[gbrain]");
+        console.log(
+          "[gbrain] Hands-off (silent quiet-hours auto-upgrade for always-on installs):",
+        );
+        console.log("[gbrain]   gbrain config set self_upgrade.mode auto");
+        console.log(
+          "[gbrain] Turn it off entirely: gbrain config set self_upgrade.mode off",
+        );
+        console.log(
+          "═══════════════════════════════════════════════════════════════",
+        );
+        console.log("");
+        su.mode_prompted = true;
+        changed = true;
+      }
+      if (changed) {
+        cfg.self_upgrade = su;
+        saveConfig(cfg);
+      }
+    }
+  } catch {
+    /* best-effort */
+  }
+  try {
+    const { migrateSystemdUnitToRestartAlways } =
+      await import("./autopilot.ts");
+    const r = migrateSystemdUnitToRestartAlways();
+    if (r.rewritten) {
+      console.log(
+        "[gbrain] Updated autopilot systemd unit to Restart=always (self-upgrade relaunch).",
+      );
+    }
+  } catch {
+    /* best-effort */
+  }
+}
+
 export async function runPostUpgrade(args: string[] = []): Promise<void> {
-  if (args.includes('--help') || args.includes('-h')) {
-    console.log('Usage: gbrain post-upgrade');
-    console.log('Prints feature pitches for new migrations and runs apply-migrations.');
-    console.log('Idempotent — safe to re-run any time.');
+  if (args.includes("--help") || args.includes("-h")) {
+    console.log("Usage: gbrain post-upgrade");
+    console.log(
+      "Prints feature pitches for new migrations and runs apply-migrations.",
+    );
+    console.log("Idempotent — safe to re-run any time.");
     return;
   }
+
+  // v0.35.8.0: lay down ~/.gbrain/.gitignore retroactively. Existing users
+  // never re-run `gbrain init`, so init-only coverage misses them entirely
+  // (codex F-CDX-8). Idempotent + non-clobbering — safe to run every upgrade.
+  try {
+    const { ensureGitignore } = await import("../core/config.ts");
+    ensureGitignore();
+  } catch {
+    // Best-effort hygiene; never block upgrade.
+  }
+
+  // v0.42 self-upgrade setup: default existing installs to NOTIFY (a nudge, no
+  // autonomy), inform once, and rewrite an existing systemd unit to
+  // Restart=always so the silent channel's exit-for-relaunch respawns. All
+  // file-plane + mechanical + idempotent; never blocks the upgrade.
+  await applySelfUpgradeSetup();
   // Cosmetic: print feature pitches for migrations newer than the prior binary.
   try {
-    const statePath = join(process.env.HOME || '', '.gbrain', 'upgrade-state.json');
+    const statePath = join(
+      process.env.HOME || "",
+      ".gbrain",
+      "upgrade-state.json",
+    );
     if (existsSync(statePath)) {
-      const state = JSON.parse(readFileSync(statePath, 'utf-8'));
+      const state = JSON.parse(readFileSync(statePath, "utf-8"));
       const from = state?.last_upgrade?.from;
       if (from) {
-        const { migrations } = await import('./migrations/index.ts');
+        const { migrations } = await import("./migrations/index.ts");
         for (const m of migrations) {
           if (isNewerThan(m.version, from)) {
-            console.log('');
+            console.log("");
             console.log(`NEW: ${m.featurePitch.headline}`);
-            if (m.featurePitch.description) console.log(m.featurePitch.description);
+            if (m.featurePitch.description)
+              console.log(m.featurePitch.description);
             if (m.featurePitch.recipe) {
-              console.log(`Run \`gbrain integrations show ${m.featurePitch.recipe}\` to set it up.`);
+              console.log(
+                `Run \`gbrain integrations show ${m.featurePitch.recipe}\` to set it up.`,
+              );
             }
-            console.log('');
+            console.log("");
           }
         }
       }
@@ -333,15 +608,15 @@ export async function runPostUpgrade(args: string[] = []): Promise<void> {
   // when nothing is pending. Stays inside the same process so a long Phase F
   // (autopilot install) doesn't hit a subprocess boundary.
   try {
-    const { runApplyMigrations } = await import('./apply-migrations.ts');
-    await runApplyMigrations(['--yes', '--non-interactive']);
+    const { runApplyMigrations } = await import("./apply-migrations.ts");
+    await runApplyMigrations(["--yes", "--non-interactive"]);
   } catch (e) {
     // Surface the error but don't throw — post-upgrade is best-effort.
     // Users can re-run `gbrain apply-migrations` manually if they want
     // to retry.
     const msg = e instanceof Error ? e.message : String(e);
     console.error(`\napply-migrations failed: ${msg}`);
-    console.error('Run `gbrain apply-migrations --yes` manually to retry.');
+    console.error("Run `gbrain apply-migrations --yes` manually to retry.");
   }
 
   // v0.28.5 (X1): explicitly apply pending schema migrations.
@@ -353,35 +628,209 @@ export async function runPostUpgrade(args: string[] = []): Promise<void> {
   // A1's hasPendingMigrations probe in connectEngine is belt-and-suspenders
   // for any path that bypasses upgrade (autopilot, direct CLI on stale brain).
   try {
-    const { loadConfig: lcSchema, toEngineConfig: toCfgSchema } = await import('../core/config.ts');
-    const { createEngine } = await import('../core/engine-factory.ts');
+    const { loadConfig: lcSchema, toEngineConfig: toCfgSchema } =
+      await import("../core/config.ts");
+    const { createEngine } = await import("../core/engine-factory.ts");
     const cfgSchema = lcSchema();
     if (cfgSchema) {
       const engine = await createEngine(toCfgSchema(cfgSchema));
       try {
         await engine.connect(toCfgSchema(cfgSchema));
         await engine.initSchema();
-        console.log('  Schema up to date.');
+        console.log("  Schema up to date.");
+
+        // v0.32.3 search-lite mode banner. One-shot: fires at most once per
+        // install (state persisted via `search.mode_upgrade_notice_shown`).
+        // Reframes from "behavior is regressing" to "named modes available"
+        // per [CDX-1+2+3]: the production query op still defaults expand=true
+        // and limit=20 — Garry's behavior is NOT regressing.
+        try {
+          const shown = await engine.getConfig(
+            "search.mode_upgrade_notice_shown",
+          );
+          const existingMode = await engine.getConfig("search.mode");
+          if (shown !== "true" && !existingMode) {
+            console.log("");
+            console.log(
+              "═══════════════════════════════════════════════════════════════",
+            );
+            console.log(
+              "[gbrain] v0.32.3 added named search modes (conservative/balanced/tokenmax).",
+            );
+            console.log(
+              "[gbrain] Your current behavior is unchanged — the `query` op still defaults",
+            );
+            console.log("[gbrain] expand=true and limit=20, same as v0.31.x.");
+            console.log(
+              "═══════════════════════════════════════════════════════════════",
+            );
+            console.log("");
+            console.log(
+              "[AGENT] Relay this matrix to your operator and ask which mode they want.",
+            );
+            console.log(
+              "[AGENT] Recommended default: tokenmax (preserves current retrieval shape).",
+            );
+            console.log(
+              "[AGENT] Run `gbrain config set search.mode <mode>` after they decide.",
+            );
+            console.log("");
+            console.log(
+              "Per-query cost @ 10K queries/mo (typical single-user volume):",
+            );
+            console.log("");
+            console.log("                  Haiku 4.5    Sonnet 4.6   Opus 4.7");
+            console.log("                  ($1/M)       ($3/M)       ($5/M)");
+            console.log("  conservative    $40/mo       $120/mo      $200/mo");
+            console.log("  balanced        $100/mo      $300/mo      $500/mo");
+            console.log(
+              "  tokenmax        $200/mo      $600/mo      $1,000/mo",
+            );
+            console.log("");
+            console.log("  (scales linearly — multiply by 10 for 100K/mo)");
+            console.log(
+              "  25x corner-to-corner spread. Natural diagonal pairings span ~4x.",
+            );
+            console.log("");
+            console.log("To pick:");
+            console.log(
+              "  gbrain search modes              # see what is running",
+            );
+            console.log(
+              "  gbrain config set search.mode <conservative|balanced|tokenmax>",
+            );
+            console.log(
+              "  gbrain search tune               # data-driven recommendations",
+            );
+            console.log("");
+            console.log(
+              "tokenmax bumps limit to 50 (current default is 20). To preserve",
+            );
+            console.log("your EXACT current shape:");
+            console.log("  gbrain config set search.mode tokenmax");
+            console.log("  gbrain config set search.searchLimit 20");
+            console.log("");
+            await engine.setConfig("search.mode_upgrade_notice_shown", "true");
+          }
+        } catch {
+          // Banner is cosmetic; never block the upgrade.
+        }
+
+        // PR1: skill-catalog publish consent. New installs default ON at
+        // `gbrain init`; EXISTING installs stay OFF (default-OFF runtime = no
+        // silent capability grant on upgrade) until the owner opts in HERE.
+        // One-time, gated by `mcp.publish_skills_prompted`. Strongly recommended.
+        try {
+          const prompted = await engine.getConfig(
+            "mcp.publish_skills_prompted",
+          );
+          const current = await engine.getConfig("mcp.publish_skills");
+          if (prompted !== "true" && current == null) {
+            const { autoDetectSkillsDir } =
+              await import("../core/repo-root.ts");
+            const det = autoDetectSkillsDir();
+            const dirLine = det.dir
+              ? `Skills dir: ${det.dir} (source: ${det.source})`
+              : "Skills dir: not auto-detected — set $GBRAIN_SKILLS_DIR or mcp.skills_dir before enabling.";
+            console.log("");
+            console.log(
+              "═══════════════════════════════════════════════════════════════",
+            );
+            console.log("[gbrain] Publish your skills to MCP clients?");
+            console.log(
+              "[gbrain] Codex desktop, Claude Code/Cowork, and Perplexity can then",
+            );
+            console.log(
+              "[gbrain] DISCOVER and FOLLOW your agent's skills over `gbrain serve`.",
+            );
+            console.log(
+              "[gbrain] This makes your MCP server dramatically more useful.",
+            );
+            console.log("[gbrain]");
+            console.log(`[gbrain] ${dirLine}`);
+            console.log(
+              "[gbrain] Effect: the CONTENTS of your SKILL.md files become readable by",
+            );
+            console.log(
+              "[gbrain] remote MCP callers you have authorized. Source code is NOT exposed.",
+            );
+            console.log(
+              "═══════════════════════════════════════════════════════════════",
+            );
+            const isTty = Boolean(process.stdin.isTTY && process.stdout.isTTY);
+            let enabled = false;
+            if (isTty) {
+              const { createInterface } = await import("readline");
+              enabled = await new Promise<boolean>((resolveAns) => {
+                const rl = createInterface({
+                  input: process.stdin,
+                  output: process.stdout,
+                });
+                rl.question(
+                  "[gbrain] Enable skill publishing now? (recommended) [Y/n] ",
+                  (answer) => {
+                    rl.close();
+                    const a = answer.trim().toLowerCase();
+                    resolveAns(a === "" || a === "y" || a === "yes");
+                  },
+                );
+                rl.on("close", () => resolveAns(false));
+              });
+            } else {
+              console.log(
+                "[AGENT] Relay this to your operator. Recommended: enable it.",
+              );
+              console.log(
+                "[AGENT] Enable with: gbrain config set mcp.publish_skills true",
+              );
+            }
+            if (enabled) {
+              await engine.setConfig("mcp.publish_skills", "true");
+              console.log(
+                "[gbrain] Skill publishing ENABLED. Disable anytime: gbrain config set mcp.publish_skills false",
+              );
+            } else if (isTty) {
+              console.log(
+                "[gbrain] Left disabled. Enable later: gbrain config set mcp.publish_skills true",
+              );
+            }
+            await engine.setConfig("mcp.publish_skills_prompted", "true");
+          }
+        } catch {
+          // Consent prompt is best-effort; never block the upgrade.
+        }
 
         // v0.32.7 CJK wave: chunker-version bump → re-embed sweep.
         // Idempotent — `runReindex` short-circuits when no pages are pending.
         try {
-          const { runPostUpgradeReembedPrompt } = await import('../core/post-upgrade-reembed.ts');
-          const { getEmbeddingModel } = await import('../core/ai/gateway.ts');
-          let modelString = 'openai:text-embedding-3-large';
-          try { modelString = getEmbeddingModel(); } catch { /* gateway not configured — keep default */ }
-          const promptResult = await runPostUpgradeReembedPrompt(engine, modelString);
+          const { runPostUpgradeReembedPrompt } =
+            await import("../core/post-upgrade-reembed.ts");
+          const { getEmbeddingModel } = await import("../core/ai/gateway.ts");
+          let modelString = "openai:text-embedding-3-large";
+          try {
+            modelString = getEmbeddingModel();
+          } catch {
+            /* gateway not configured — keep default */
+          }
+          const promptResult = await runPostUpgradeReembedPrompt(
+            engine,
+            modelString,
+          );
           if (promptResult.proceeded) {
-            const { runReindex } = await import('./reindex.ts');
-            await runReindex(engine, ['--markdown']);
+            const { runReindex } = await import("./reindex.ts");
+            await runReindex(engine, ["--markdown"]);
           }
         } catch (re) {
           const msg = re instanceof Error ? re.message : String(re);
           console.warn(`\nChunker-bump reindex skipped: ${msg}`);
-          console.warn('Run `gbrain reindex --markdown` manually when ready.');
+          console.warn("Run `gbrain reindex --markdown` manually when ready.");
         }
       } finally {
-        try { await engine.disconnect(); } catch { /* best-effort */ }
+        try {
+          await engine.disconnect();
+        } catch {
+          /* best-effort */
+        }
       }
     }
   } catch (e) {
@@ -390,17 +839,109 @@ export async function runPostUpgrade(args: string[] = []): Promise<void> {
     // hint to run `gbrain init --migrate-only`.
     const msg = e instanceof Error ? e.message : String(e);
     console.warn(`\nSchema auto-apply skipped: ${msg}`);
-    console.warn('Run `gbrain init --migrate-only` manually if your brain is wedged.');
+    console.warn(
+      "Run `gbrain init --migrate-only` manually if your brain is wedged.",
+    );
   }
 
   // v0.25.1: agent-readable advisory listing recommended skills the
   // workspace hasn't installed yet. No-op when everything is installed.
   try {
-    const { printAdvisoryIfRecommended } = await import('../core/skillpack/post-install-advisory.ts');
-    const { VERSION } = await import('../version.ts');
-    printAdvisoryIfRecommended({ version: VERSION, context: 'upgrade' });
+    const { printAdvisoryIfRecommended } =
+      await import("../core/skillpack/post-install-advisory.ts");
+    const { VERSION } = await import("../version.ts");
+    printAdvisoryIfRecommended({ version: VERSION, context: "upgrade" });
   } catch {
     // Best-effort cosmetic surface; never block post-upgrade.
+  }
+
+  // v0.36 DX: skillpack reference sweep. After an upgrade, the gbrain bundle
+  // may have shipped changes to scaffolded skills the host already has on
+  // disk. Run `reference --all` automatically and print a one-line-per-skill
+  // summary so the agent + operator see what drifted without manually
+  // running the sweep. Skipped silently when:
+  //   - GBRAIN_SKIP_REFERENCE_SWEEP=1 in env
+  //   - no target workspace can be auto-detected (gbrain installed but
+  //     never scaffolded anywhere)
+  //   - the detected workspace IS the gbrain repo (dev-mode, would just
+  //     compare gbrain against itself)
+  //   - every scaffolded skill is identical (nothing to say)
+  await postUpgradeReferenceSweep();
+
+  // v0.41.18.0 (A4 + A18, T14): post-upgrade onboard banner. Fail-open;
+  // doesn't engine-connect (lightweight TTY check only). The actual
+  // recommendations need engine access via `gbrain onboard --check`;
+  // the banner just nudges the user to run it.
+  try {
+    const { runUpgradeBanner } = await import("../core/onboard/init-nudge.ts");
+    // The banner doesn't actually use the engine today; passing null-equivalent
+    // would require a type widening. Skip the engine arg and let the banner
+    // print the static nudge text.
+    await runUpgradeBanner(null as never);
+  } catch {
+    // Fail-open per A18: never crash post-upgrade from the banner.
+  }
+}
+
+/**
+ * Run `reference --all` against the auto-detected host workspace and print
+ * a one-line-per-skill summary of any drift. Best-effort; failures are
+ * swallowed so a broken sweep never blocks post-upgrade.
+ *
+ * Exported (with optional `opts` test seam) for unit testing the gate
+ * logic + output shape. Production callers pass no args — both paths are
+ * auto-detected.
+ */
+export async function postUpgradeReferenceSweep(
+  opts: { gbrainRoot?: string; targetWorkspace?: string } = {},
+): Promise<void> {
+  if (process.env.GBRAIN_SKIP_REFERENCE_SWEEP) return;
+  try {
+    const { autoDetectSkillsDirReadOnly } =
+      await import("../core/repo-root.ts");
+    const { findGbrainRoot } = await import("../core/skillpack/bundle.ts");
+    const { runReferenceAll } = await import("../core/skillpack/reference.ts");
+    const path = await import("path");
+
+    // Allow tests to inject; default to auto-detection.
+    let targetWorkspace = opts.targetWorkspace;
+    if (!targetWorkspace) {
+      const detected = autoDetectSkillsDirReadOnly();
+      if (!detected.dir) return;
+      targetWorkspace = path.resolve(detected.dir, "..");
+    }
+
+    const gbrainRoot = opts.gbrainRoot ?? findGbrainRoot();
+    if (!gbrainRoot) return;
+
+    // Dev-mode guard: the detected workspace IS the gbrain repo. Sweeping
+    // gbrain against itself is always identical — print nothing.
+    if (path.resolve(targetWorkspace) === path.resolve(gbrainRoot)) return;
+
+    const result = runReferenceAll({ gbrainRoot, targetWorkspace });
+    // Print only skills that (a) the host has actually scaffolded, AND
+    // (b) have at least one differs or missing entry. Pure-`missing`
+    // skills the host never scaffolded are noise; skip them.
+    const drifted = result.skills.filter(
+      (s) =>
+        s.summary.identical + s.summary.differs > 0 &&
+        (s.summary.differs > 0 || s.summary.missing > 0),
+    );
+    if (drifted.length === 0) return;
+
+    console.log("");
+    console.log("Skillpack reference sweep (post-upgrade):");
+    for (const s of drifted) {
+      console.log(
+        `  ${s.slug.padEnd(40)} differs:${s.summary.differs} missing:${s.summary.missing}`,
+      );
+    }
+    console.log("");
+    console.log(
+      "Run `gbrain skillpack reference <slug>` to inspect per-skill diffs.\nSee `skills/_AGENT_README.md` for what your agent should do on update.\nSkip this sweep: `GBRAIN_SKIP_REFERENCE_SWEEP=1`.",
+    );
+  } catch {
+    // Best-effort. Never block post-upgrade.
   }
 }
 
@@ -410,8 +951,8 @@ export async function runPostUpgrade(args: string[] = []): Promise<void> {
 // (Codex K).
 
 function isNewerThan(version: string, baseline: string): boolean {
-  const v = version.split('.').map(Number);
-  const b = baseline.split('.').map(Number);
+  const v = version.split(".").map(Number);
+  const b = baseline.split(".").map(Number);
   for (let i = 0; i < 3; i++) {
     if ((v[i] || 0) > (b[i] || 0)) return true;
     if ((v[i] || 0) < (b[i] || 0)) return false;
@@ -419,8 +960,13 @@ function isNewerThan(version: string, baseline: string): boolean {
   return false;
 }
 
-export function detectInstallMethod(): 'bun' | 'bun-link' | 'binary' | 'clawhub' | 'unknown' {
-  const execPath = process.execPath || '';
+export function detectInstallMethod():
+  | "bun"
+  | "bun-link"
+  | "binary"
+  | "clawhub"
+  | "unknown" {
+  const execPath = process.execPath || "";
 
   // v0.28.5 cluster D: bun-link signal first.
   // bun link puts a symlink at ~/.bun/bin/gbrain → either the source's bin
@@ -428,33 +974,36 @@ export function detectInstallMethod(): 'bun' | 'bun-link' | 'binary' | 'clawhub'
   // resolves into a directory we can walk up from to find a .git/config
   // pointing at our repo.
   const bunLinkResult = detectBunLink();
-  if (bunLinkResult) return 'bun-link';
+  if (bunLinkResult) return "bun-link";
 
   // Check if running from node_modules (bun/npm install). Could be canonical
   // (we publish under garrytan/gbrain) OR the squatter (npm `gbrain@1.3.x`).
   // Sub-classify and warn loudly on suspect installs (#658).
-  if (execPath.includes('node_modules') || process.argv[1]?.includes('node_modules')) {
+  if (
+    execPath.includes("node_modules") ||
+    process.argv[1]?.includes("node_modules")
+  ) {
     const verdict = classifyBunInstall();
-    if (verdict === 'suspect') {
+    if (verdict === "suspect") {
       printSquatterRecovery();
     }
-    return 'bun';
+    return "bun";
   }
 
   // Check if running as compiled binary
-  if (execPath.endsWith('/gbrain') || execPath.endsWith('\\gbrain.exe')) {
-    return 'binary';
+  if (execPath.endsWith("/gbrain") || execPath.endsWith("\\gbrain.exe")) {
+    return "binary";
   }
 
   // Check if clawhub is available (use --version, not which, to avoid false positives)
   try {
-    execSync('clawhub --version', { stdio: 'pipe', timeout: 5_000 });
-    return 'clawhub';
+    execSync("clawhub --version", { stdio: "pipe", timeout: 5_000 });
+    return "clawhub";
   } catch {
     // not available
   }
 
-  return 'unknown';
+  return "unknown";
 }
 
 /**
@@ -479,14 +1028,16 @@ function detectBunLink(): { repoRoot: string } | null {
 
     let dir = dirname(resolve(argv1));
     for (let i = 0; i < 6; i++) {
-      const gitConfigPath = join(dir, '.git', 'config');
+      const gitConfigPath = join(dir, ".git", "config");
       if (existsSync(gitConfigPath)) {
         try {
-          const cfg = readFileSync(gitConfigPath, 'utf-8');
+          const cfg = readFileSync(gitConfigPath, "utf-8");
           if (cfg.toLowerCase().includes(GBRAIN_GITHUB_REPO.toLowerCase())) {
             return { repoRoot: dir };
           }
-        } catch { /* unreadable config — not our case */ }
+        } catch {
+          /* unreadable config — not our case */
+        }
         return null;
       }
       const parent = dirname(dir);
@@ -516,59 +1067,70 @@ function detectBunLink(): { repoRoot: string } | null {
  * an assertion. The right structural fix is publishing under a scoped
  * name like `@garrytan/gbrain` (tracked v0.29 follow-up).
  */
-function classifyBunInstall(): 'canonical' | 'suspect' {
+function classifyBunInstall(): "canonical" | "suspect" {
   try {
     const argv1 = process.argv[1];
-    if (!argv1) return 'suspect';
+    if (!argv1) return "suspect";
 
     // Walk up from argv1 looking for the package.json that owns this install.
     let dir = dirname(realpathSync(argv1));
     for (let i = 0; i < 6; i++) {
-      const pkgPath = join(dir, 'package.json');
+      const pkgPath = join(dir, "package.json");
       if (existsSync(pkgPath)) {
         try {
-          const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8'));
-          const repoUrl = (typeof pkg.repository === 'string'
-            ? pkg.repository
-            : pkg.repository?.url) ?? '';
-          if (repoUrl.toLowerCase().includes(GBRAIN_GITHUB_REPO.toLowerCase())) {
-            return 'canonical';
+          const pkg = JSON.parse(readFileSync(pkgPath, "utf-8"));
+          const repoUrl =
+            (typeof pkg.repository === "string"
+              ? pkg.repository
+              : pkg.repository?.url) ?? "";
+          if (
+            repoUrl.toLowerCase().includes(GBRAIN_GITHUB_REPO.toLowerCase())
+          ) {
+            return "canonical";
           }
           // Source-marker fallback: our published-as-source install always
           // ships src/cli.ts next to package.json. The squatter ships dist/.
-          if (existsSync(join(dir, 'src', 'cli.ts'))) {
-            return 'canonical';
+          if (existsSync(join(dir, "src", "cli.ts"))) {
+            return "canonical";
           }
-          return 'suspect';
+          return "suspect";
         } catch {
-          return 'suspect';
+          return "suspect";
         }
       }
       const parent = dirname(dir);
       if (parent === dir) break;
       dir = parent;
     }
-    return 'suspect';
+    return "suspect";
   } catch {
-    return 'suspect';
+    return "suspect";
   }
 }
 
 function printSquatterRecovery(): void {
-  console.warn('');
-  console.warn('  WARNING: gbrain install does not appear to be from garrytan/gbrain.');
-  console.warn('  This is likely the npm-name collision tracked in issue #658:');
-  console.warn('    https://www.npmjs.com/package/gbrain (an unrelated package).');
-  console.warn('');
-  console.warn('  Recovery options:');
-  console.warn('    1. Install from source:');
-  console.warn('         bun remove -g gbrain');
-  console.warn('         git clone https://github.com/garrytan/gbrain.git');
-  console.warn('         cd gbrain && bun install && bun link');
-  console.warn('');
-  console.warn('    2. Download a release binary:');
-  console.warn('         https://github.com/garrytan/gbrain/releases');
-  console.warn('');
-  console.warn('  See docs/INSTALL_FOR_AGENTS.md for the canonical install paths.');
-  console.warn('');
+  console.warn("");
+  console.warn(
+    "  WARNING: gbrain install does not appear to be from garrytan/gbrain.",
+  );
+  console.warn(
+    "  This is likely the npm-name collision tracked in issue #658:",
+  );
+  console.warn(
+    "    https://www.npmjs.com/package/gbrain (an unrelated package).",
+  );
+  console.warn("");
+  console.warn("  Recovery options:");
+  console.warn("    1. Install from source:");
+  console.warn("         bun remove -g gbrain");
+  console.warn("         git clone https://github.com/garrytan/gbrain.git");
+  console.warn("         cd gbrain && bun install && bun link");
+  console.warn("");
+  console.warn("    2. Download a release binary:");
+  console.warn("         https://github.com/garrytan/gbrain/releases");
+  console.warn("");
+  console.warn(
+    "  See docs/INSTALL_FOR_AGENTS.md for the canonical install paths.",
+  );
+  console.warn("");
 }
