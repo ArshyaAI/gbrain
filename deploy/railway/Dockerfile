@@ -7,9 +7,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     && echo "${GBRAIN_SHA256}  /usr/local/bin/gbrain" | sha256sum -c - \
     && chmod 755 /usr/local/bin/gbrain \
     && gbrain --version
+RUN apt-get update && apt-get install -y --no-install-recommends python3 && rm -rf /var/lib/apt/lists/*
 WORKDIR /opt/gbrain
 COPY skills/ ./skills/
 COPY deploy/railway/entrypoint.sh /usr/local/bin/gbrain-entrypoint
+COPY deploy/railway/verify.py /opt/gbrain/verify.py
 RUN chmod 755 /usr/local/bin/gbrain-entrypoint
 ENV GBRAIN_HOME=/data GBRAIN_NO_AUTOPILOT_INSTALL=1 GBRAIN_MODEL_DISCOVERY=0 GBRAIN_SWEEP=0
 EXPOSE 3131
