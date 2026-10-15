@@ -16,5 +16,6 @@ fi
 gbrain config set self_upgrade.mode off
 gbrain config set memory.auto_writeback off
 public_url="${GBRAIN_PUBLIC_URL:-https://${RAILWAY_PUBLIC_DOMAIN:?missing public origin}}"
+python3 /opt/gbrain/verify.py &
 exec gbrain serve --http --bind 0.0.0.0 --port "${PORT:-3131}" \
   --public-url "$public_url" --surface full --suppress-bootstrap-token --fail-fast
